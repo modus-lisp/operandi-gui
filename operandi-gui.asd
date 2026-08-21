@@ -8,6 +8,11 @@
 ;;;;
 ;;;; :operandi-gui/serve is the STANDALONE HTTP server (a browser page with a warp list
 ;;;; + an <input> + a session picker) for local use at 127.0.0.1:8790.
+;;;;
+;;;; :operandi-gui/gateway is the fat glue that makes the core reachable from a PHONE through the
+;;;; glass WebRTC gateway: chord voice out + karaoke, stave dictation in, and the phone panel's
+;;;; control frames. The gateway "site" lazy-loads this and calls into it; it depends on nothing
+;;;; heavier than the core (the desktop is a UNIX socket, the phone a callback the host owns).
 
 (defsystem "operandi-gui"
   :description "operandi chat as a warp projection — model, sessions, agent; no transport."
@@ -23,3 +28,10 @@
   :depends-on ("operandi-gui" "warp-dom/serve")
   :serial t
   :components ((:file "serve")))
+
+(defsystem "operandi-gui/gateway"
+  :description "Host operandi-gui on the glass WebRTC gateway: chord voice + stave dictation + karaoke,
+routed to the desktop over its seat socket and to the phone over a host callback."
+  :depends-on ("operandi-gui")
+  :serial t
+  :components ((:file "gateway")))
