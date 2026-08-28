@@ -20,7 +20,8 @@
            #:*proj* #:chat-projection
            #:say #:new-session! #:open-session! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
-           #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences))
+           #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
+           #:set-model #:handle-command))
 (in-package #:operandi-gui)
 
 ;; Chat conversations are operandi sessions (reused wholesale: persisted as
@@ -30,7 +31,9 @@
       (namestring (merge-pathnames ".operandi/chat-sessions/" (user-homedir-pathname))))
 
 ;;; ------------------------------- config -------------------------------
-(defparameter *model* (or (uiop:getenv "OPERANDI_CHAT_MODEL") "deepseek/deepseek-v4-flash"))
+(defparameter *model* (or (uiop:getenv "OPERANDI_CHAT_MODEL") "z-ai/glm-5.3-flash")
+  "The model a fresh chat starts on.  Changed live with /model — which pings the new one and keeps
+   the old if it does not answer, so the default here is a starting point and not a commitment.")
 (defparameter *tool-names* nil "engine tool allow-list; NIL = full toolset.")
 (defparameter *system-prompt*
   "You are operandi, in a web chat with your operator. Answer in plain text,
@@ -134,15 +137,61 @@ fabricate a value."
 (defvar *speak-enabled* nil "when T, each finished bot reply is handed to *SPEAK-FN*.")
 (defvar *speak-fn* nil "(lambda (text)) — voice TEXT, or NIL for no voice.")
 
+;;; ------------------------------ /commands ----------------------------
+;;; Typed into the same box as everything else, because on a phone that box is the only input this
+;;; app has.  A line beginning with / is the GUI's own and never reaches the agent.
+
+(defun set-model (slug)
+  "Switch the agent to SLUG — but PROVE it first.  ENG:PREFLIGHT-MODEL sends a one-token ping and
+   reads the provider's own reason, so a typo, a retired slug, or a provider-allowlist miss is
+   caught here rather than turning every later turn into a blank reply.  A switch that does not
+   preflight is rolled back: better the model you had than one that cannot answer."
+  (let ((old *model*))
+    (llm:use-openrouter :model slug)
+    (multiple-value-bind (ok reason) (eng:preflight-model)
+      (cond (ok (setf *model* slug)
+                (format nil "Model is now ~a." slug))
+            (t (llm:use-openrouter :model old)
+               (format nil "~a did not answer, so I kept ~a.~@[~%~%~a~]" slug old reason))))))
+
+(defun handle-command (line)
+  "Answer a /command, or return NIL if LINE is not one."
+  (let* ((s (string-trim '(#\Space #\Tab) line))
+         (sp (position #\Space s))
+         (verb (string-downcase (subseq s 0 (or sp (length s)))))
+         (arg (and sp (string-trim '(#\Space #\Tab) (subseq s sp)))))
+    (cond
+      ((not (and (plusp (length s)) (char= (char s 0) #\/))) nil)
+      ((string= verb "/model")
+       (if (and arg (plusp (length arg)))
+           (set-model arg)
+           (format nil "Model is `~a`.~%~%Change it with `/model <slug>` — I ping the model and keep ~
+                        the old one if it doesn't answer." *model*)))
+      ((string= verb "/new")
+       (new-session!)
+       "Started a fresh conversation.")
+      ((member verb '("/help" "/?") :test #'string=)
+       (format nil "- `/model [slug]` — show or switch the model~%~
+                    - `/new` — start a fresh conversation~%~
+                    - `/help` — this"))
+      (t (format nil "I don't know `~a`. Try `/help`." verb)))))
+
 (defun say (text)
-  "Operator sent TEXT: show it, and enqueue a turn for the agent."
+  "Operator sent TEXT: show it, and enqueue a turn for the agent — unless it is a /command, which
+   the GUI answers itself and the agent never sees."
   (let ((s (string-trim '(#\Space #\Newline #\Return #\Tab) text)))
     (when (plusp (length s))
       (unless *session* (new-session!))     ; typing implies a chat; open one if cold
       (add-msg "you" s :you)
-      (bt:with-lock-held (*qlock*)
-        (setf *queue* (nconc *queue* (list s)))
-        (bt:condition-notify *qcv*)))))
+      (let ((cmd (and (char= (char s 0) #\/)
+                      (handler-case (handle-command s)
+                        (serious-condition (e) (format nil "That went wrong: ~a" e))))))
+        (if cmd
+            ;; the GUI is answering, so it lands as a reply and nothing is queued for the engine
+            (add-msg "operandi" cmd :bot)
+            (bt:with-lock-held (*qlock*)
+              (setf *queue* (nconc *queue* (list s)))
+              (bt:condition-notify *qcv*)))))))
 
 (defun answer (text)
   "Run one engine turn threaded onto the live session's history, and persist it."
