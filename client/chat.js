@@ -9,7 +9,7 @@
 // The gateway side (warp-channel.lisp) has the matching Lisp half in :operandi-gui/gateway: chord
 // voice out, stave dictation in, and the {a:chat,...} control frames this panel sends.
 
-const CHAT_CSS = "    /* ==== BEGIN the operandi chat's stylesheet ===============================================\n       THE THIRD WARP APP, ON THE SAME CHANNEL.  Rows arrive as .v (the message text) + .l (a\n       hidden kind tag: you|bot|think|err) exactly like the panels above; chatDecorate() reads the\n       tag to pick a bubble class and renders a little markdown into .v.  The one thing warp does\n       not carry is free text IN \u2014 so this panel, unlike the two above, has an <input>, and its\n       sends are {a:'chat',say:\u2026} which the gateway hands to the agent. */\n    #chatPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;\n      flex-direction:column;background:rgba(8,10,14,.93);border:1px solid rgba(255,255,255,.12);\n      border-radius:12px;overflow:hidden;\n      font:13px/1.4 -apple-system,system-ui,sans-serif;color:#dce4ec}\n    #chatHead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;\n      padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.1);color:#8a949c;flex:0 0 auto;\n      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}\n    #chatHead b{color:#dce4ec;font-weight:600;letter-spacing:.04em}\n    /* voice controls: a strip just above the input, not in the header */\n    #chatCtl{display:flex;align-items:center;gap:12px;padding:6px 12px 2px;flex:0 0 auto}\n    #chatSpeakLbl{color:#8a949c;display:flex;align-items:center;gap:5px;\n      cursor:pointer;user-select:none;font-size:12px}\n    #chatSpeakLbl input{accent-color:#1f6feb;width:16px;height:16px}\n    #chatStop,#chatMic{background:none;border:1px solid rgba(255,255,255,.18);color:#b3bcc4;\n      border-radius:8px;padding:3px 10px;font-size:12px;line-height:1.3;cursor:pointer;touch-action:manipulation}\n    #chatStop:active,#chatMic:active{background:rgba(255,255,255,.12)}\n    #chatMic.on{background:#c0392b;border-color:#c0392b;color:#fff}   /* recording = red */\n    #chatBody{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px}\n    #chatRows{list-style:none;margin:0;padding:0}\n    #chatRows li{max-width:82%;margin:7px 0;padding:8px 12px;border-radius:14px;\n      white-space:pre-wrap;word-break:break-word}\n    #chatRows li .l,#chatRows li .stale{display:none}\n    #chatRows li .v b{font-weight:600}\n    #chatRows li .v code{background:#0b0e12;border:1px solid #2a3644;border-radius:5px;\n      padding:1px 5px;font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}\n    #chatRows li .v .sent{border-radius:5px;transition:background .1s}\n    #chatRows li .v .sent.on{background:rgba(31,111,235,.5);box-shadow:0 0 0 3px rgba(31,111,235,.5);color:#fff}\n    #chatRows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}\n    #chatRows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}\n    #chatRows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}\n    #chatRows li.err{margin-right:auto;background:#3a1c1c;color:#ffb0b0}\n    #chatForm{display:flex;gap:8px;padding:9px;border-top:1px solid rgba(255,255,255,.1);flex:0 0 auto}\n    #chatInput{flex:1 1 auto;background:#161d27;border:1px solid #2a3644;border-radius:18px;\n      color:#e6edf3;padding:9px 14px;font:14px/1.3 -apple-system,system-ui,sans-serif;outline:none}\n    #chatInput:focus{border-color:#1f6feb}\n    #chatForm button{background:#1f6feb;color:#fff;border:0;border-radius:18px;padding:0 16px;\n      font:600 14px/1 inherit}\n    #chatNote{padding:6px 12px;color:#8a949c;flex:0 0 auto;font:11px/1.35 ui-monospace,Menlo,monospace;\n      border-top:1px solid rgba(255,255,255,.08)}\n    #chatNote:empty{display:none}\n    /* ==== END the operandi chat's stylesheet ================================================= */";
+const CHAT_CSS = "    /* ==== BEGIN the operandi chat's stylesheet ===============================================\n       THE THIRD WARP APP, ON THE SAME CHANNEL.  Rows arrive as .v (the message text) + .l (a\n       hidden kind tag: you|bot|think|err) exactly like the panels above; chatDecorate() reads the\n       tag to pick a bubble class and renders a little markdown into .v.  The one thing warp does\n       not carry is free text IN \u2014 so this panel, unlike the two above, has an <input>, and its\n       sends are {a:'chat',say:\u2026} which the gateway hands to the agent. */\n    #chatPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;\n      flex-direction:column;background:rgba(8,10,14,.93);border:1px solid rgba(255,255,255,.12);\n      border-radius:12px;overflow:hidden;\n      font:13px/1.4 -apple-system,system-ui,sans-serif;color:#dce4ec}\n    #chatHead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;\n      padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.1);color:#8a949c;flex:0 0 auto;\n      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}\n    #chatHead b{color:#dce4ec;font-weight:600;letter-spacing:.04em}\n    /* voice controls: a strip just above the input, not in the header */\n    /* settings: a sheet above the input, so a phone is never asked to type a slash */\n    #chatSet{display:none;flex-direction:column;gap:9px;padding:11px 12px;\n      border-top:1px solid rgba(255,255,255,.12);background:#0d1117;flex:0 0 auto}\n    #chatSet .r{display:flex;align-items:center;gap:10px;justify-content:space-between}\n    #chatSet b{color:#dce4ec;font:600 13px/1.3 ui-monospace,Menlo,monospace;letter-spacing:.04em}\n    #chatSet .l{color:#8a949c;font-size:11px}\n    #chatSet .l span{color:#dce4ec;font-family:ui-monospace,Menlo,monospace}\n    #chatSetList{display:flex;flex-wrap:wrap;gap:7px}\n    #chatSetList button,#chatSet .r button{background:none;border:1px solid rgba(255,255,255,.18);\n      color:#b3bcc4;border-radius:8px;padding:7px 11px;font-size:12px;cursor:pointer;touch-action:manipulation}\n    #chatSetList button.on{background:#1f6feb;border-color:#1f6feb;color:#fff}\n    #chatSetForm{display:flex;gap:7px}\n    #chatSetSlug{flex:1 1 auto;background:#161d27;border:1px solid #2a3644;border-radius:8px;\n      color:#e6edf3;padding:7px 10px;font:12px/1.3 ui-monospace,Menlo,monospace;outline:none}\n    #chatSetForm button{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:0 13px;font:600 12px/1 inherit}\n    #chatGear{background:none;border:1px solid rgba(255,255,255,.18);color:#b3bcc4;border-radius:8px;\n      padding:3px 9px;font-size:13px;line-height:1.3;cursor:pointer;margin-left:auto;touch-action:manipulation}\n    #chatCtl{display:flex;align-items:center;gap:12px;padding:6px 12px 2px;flex:0 0 auto}\n    #chatSpeakLbl{color:#8a949c;display:flex;align-items:center;gap:5px;\n      cursor:pointer;user-select:none;font-size:12px}\n    #chatSpeakLbl input{accent-color:#1f6feb;width:16px;height:16px}\n    #chatStop,#chatMic{background:none;border:1px solid rgba(255,255,255,.18);color:#b3bcc4;\n      border-radius:8px;padding:3px 10px;font-size:12px;line-height:1.3;cursor:pointer;touch-action:manipulation}\n    #chatStop:active,#chatMic:active{background:rgba(255,255,255,.12)}\n    #chatMic.on{background:#c0392b;border-color:#c0392b;color:#fff}   /* recording = red */\n    #chatBody{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px}\n    #chatRows{list-style:none;margin:0;padding:0}\n    #chatRows li{max-width:82%;margin:7px 0;padding:8px 12px;border-radius:14px;\n      white-space:pre-wrap;word-break:break-word}\n    #chatRows li .l,#chatRows li .stale{display:none}\n    #chatRows li .v b{font-weight:600}\n    #chatRows li .v code{background:#0b0e12;border:1px solid #2a3644;border-radius:5px;\n      padding:1px 5px;font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}\n    #chatRows li .v .sent{border-radius:5px;transition:background .1s}\n    #chatRows li .v .sent.on{background:rgba(31,111,235,.5);box-shadow:0 0 0 3px rgba(31,111,235,.5);color:#fff}\n    #chatRows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}\n    #chatRows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}\n    #chatRows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}\n    #chatRows li.err{margin-right:auto;background:#3a1c1c;color:#ffb0b0}\n    #chatForm{display:flex;gap:8px;padding:9px;border-top:1px solid rgba(255,255,255,.1);flex:0 0 auto}\n    #chatInput{flex:1 1 auto;background:#161d27;border:1px solid #2a3644;border-radius:18px;\n      color:#e6edf3;padding:9px 14px;font:14px/1.3 -apple-system,system-ui,sans-serif;outline:none}\n    #chatInput:focus{border-color:#1f6feb}\n    #chatForm button{background:#1f6feb;color:#fff;border:0;border-radius:18px;padding:0 16px;\n      font:600 14px/1 inherit}\n    #chatNote{padding:6px 12px;color:#8a949c;flex:0 0 auto;font:11px/1.35 ui-monospace,Menlo,monospace;\n      border-top:1px solid rgba(255,255,255,.08)}\n    #chatNote:empty{display:none}\n    /* ==== END the operandi chat's stylesheet ================================================= */";
 
 export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, spkBtn, isOn, diag }) {
   const st = document.createElement('style'); st.textContent = CHAT_CSS; document.head.appendChild(st);
@@ -50,10 +50,20 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
       '<div id="chatHead"><b>operandi</b><span id="chatStat">—</span></div>' +
       '<div id="chatBody"><ul id="chatRows"></ul></div>' +
       '<div id="chatNote"></div>' +
+      // SETTINGS, because a phone keyboard makes a slash expensive.  Every control here sends the
+      // same /command the box already parses, so a tap and a typed line are one code path.
+      '<div id="chatSet"><div class="r"><b>Settings</b>' +
+      '<button type="button" id="chatSetDone">done</button></div>' +
+      '<div class="l">Model — now <span id="chatSetNow">…</span></div>' +
+      '<div id="chatSetList"></div>' +
+      '<form id="chatSetForm"><input id="chatSetSlug" placeholder="another slug, e.g. vendor/model">' +
+      '<button type="submit">set</button></form>' +
+      '<div class="r"><button type="button" id="chatSetNew">＋ New conversation</button></div></div>' +
       '<div id="chatCtl">' +
       '<button type="button" id="chatMic" title="dictate a message">🎤 dictate</button>' +
       '<label id="chatSpeakLbl"><input type="checkbox" id="chatSpeak"> 🔊 speak</label>' +
       '<button type="button" id="chatStop" title="stop speaking">⏹ stop</button>' +
+      '<button type="button" id="chatGear" title="settings">⚙</button>' +
       '</div>' +
       '<form id="chatForm" autocomplete="off"><input id="chatInput" ' +
       'placeholder="Message operandi…"><button type="submit">Send</button></form>';
@@ -72,6 +82,47 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
     });
     // the stop button: silence the current utterance now, without changing the toggle
     chatPanel.querySelector('#chatStop').addEventListener('click', () => warpSend({ a: 'chat', hush: true }));
+    // ---- settings -------------------------------------------------------------------------
+    // Each control sends {cmd:"/…"} — the SAME command the box parses when typed — so switching is
+    // still preflighted and still lands in the transcript.  Then it asks {status:true} and paints
+    // what the box ACTUALLY has, rather than assuming what it asked for stuck.
+    const CHAT_MODELS = [
+      ['z-ai/glm-5.3-flash',         'glm-5.3-flash'],
+      ['deepseek/deepseek-v4-flash', 'deepseek-v4-flash'],
+      ['minimax/minimax-m2.7',       'minimax-m2.7'],
+      ['anthropic/claude-haiku-4.5', 'claude-haiku-4.5'],
+    ];
+    const chatSet = chatPanel.querySelector('#chatSet');
+    const chatSetNow = chatPanel.querySelector('#chatSetNow');
+    const chatSetList = chatPanel.querySelector('#chatSetList');
+    const chatSetSlug = chatPanel.querySelector('#chatSetSlug');
+    let curModel = null;
+    const paintModels = () => {
+      chatSetList.innerHTML = '';
+      for (const pair of CHAT_MODELS) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = pair[1];
+        if (pair[0] === curModel) b.className = 'on';
+        b.onclick = () => { warpSend({ a: 'chat', cmd: '/model ' + pair[0] }); chatSetNow.textContent = 'switching…'; };
+        chatSetList.append(b);
+      }
+    };
+    const openSet = on => {
+      chatSet.style.display = on ? 'flex' : 'none';
+      if (on) { chatInput.blur(); warpSend({ a: 'chat', status: true }); paintModels(); }
+    };
+    chatPanel.querySelector('#chatGear').addEventListener('click', () => openSet(chatSet.style.display !== 'flex'));
+    chatPanel.querySelector('#chatSetDone').addEventListener('click', () => openSet(false));
+    chatPanel.querySelector('#chatSetNew').addEventListener('click', () => {
+      warpSend({ a: 'chat', cmd: '/new' }); openSet(false);
+    });
+    chatPanel.querySelector('#chatSetForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const v = chatSetSlug.value.trim(); if (!v) return;
+      chatSetSlug.value = ''; chatSetSlug.blur();
+      warpSend({ a: 'chat', cmd: '/model ' + v }); chatSetNow.textContent = 'switching…';
+    });
+
     // the dictate button: unmute the phone mic (by driving the shell's OWN 🎙, so its getUserMedia,
     // its sender, and its button state all move together and the UI reflects the live mic) and tell
     // the box to start its ear; the transcript streams back into the input for review.
@@ -120,6 +171,11 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
       // a highlight tick ({a:chat, m, hl}) rides the same stream — peel it off before the warp
       // client, which would choke on a frame with no deltas.  hl>=0 lights sentence hl of message m.
       let d = null; try { d = JSON.parse(e.data); } catch (_) {}
+      if (d && d.a === 'chat' && d.model !== undefined) {     // the box saying what it actually has
+        curModel = d.model; chatSetNow.textContent = d.model;
+        if (d.speaking !== undefined) chatSpeak.checked = !!d.speaking;
+        paintModels(); return;
+      }
       if (d && d.a === 'chat' && d.dictate !== undefined) {   // live transcript -> the input box
         // ...but only while the box still holds exactly what dictation last put there.  The moment
         // you edit it (to fix a mishearing) it differs, and we leave your text alone.

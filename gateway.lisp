@@ -124,7 +124,8 @@ the stop button, {a:chat,listen:bool} the mic, {a:chat,clear:true} Send resettin
 T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames never parse."
   (when (and (search "\"chat\"" text)
              (or (search "\"say\"" text) (search "\"speak\"" text) (search "\"hush\"" text)
-                 (search "\"listen\"" text) (search "\"clear\"" text)))
+                 (search "\"listen\"" text) (search "\"clear\"" text)
+                 (search "\"status\"" text) (search "\"cmd\"" text)))
     (handler-case
         (let ((o (jzon:parse text)))
           (when (and (hash-table-p o) (equal (gethash "a" o) "chat"))
@@ -138,5 +139,17 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
                  (unless on (hush)))                        ; turning it off silences the current line
                t)
               ((nth-value 1 (gethash "hush" o)) (hush) t)
-              ((nth-value 1 (gethash "clear" o)) (voice :hearing-clear) t))))
+              ((nth-value 1 (gethash "clear" o)) (voice :hearing-clear) t)
+              ;; the settings panel asking what is currently set, so it can show the truth rather
+              ;; than what it last sent
+              ((nth-value 1 (gethash "status" o))
+               (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+                                               "speaking" (if gui:*speak-enabled* t nil))))
+               t)
+              ;; a settings tap is a /command typed for you — same handler, same transcript entry
+              ((stringp (gethash "cmd" o))
+               (gui:say (gethash "cmd" o))
+               (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+                                               "speaking" (if gui:*speak-enabled* t nil))))
+               t))))
       (error () nil))))
