@@ -32,6 +32,6 @@
 (defsystem "operandi-gui/gateway"
   :description "Host operandi-gui on the glass WebRTC gateway: chord voice + stave dictation + karaoke,
 routed to the desktop over its seat socket and to the phone over a host callback."
-  :depends-on ("operandi-gui")
+  :depends-on ("operandi-gui" "sb-introspect")
   :serial t
-  :components ((:file "gateway")))
+  :components ((:file "desk") (:file "gateway")))

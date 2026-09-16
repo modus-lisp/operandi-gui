@@ -21,7 +21,9 @@
   (:use #:cl)
   (:local-nicknames (#:gui #:operandi-gui) (#:llm #:operandi.llm)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
-  (:export #:ensure-ready #:app-spec #:note-peer #:handle-control))
+  ;; VOICE is exported because desk.lisp calls it: the desk functions are the agent's face on this
+  ;; link, and they must not reach around it into glass.
+  (:export #:ensure-ready #:app-spec #:note-peer #:handle-control #:voice))
 (in-package #:operandi-gui.gateway)
 
 ;;; ---- the two host links: no transport here, so nothing here is unix (or anything) -----------
@@ -110,7 +112,43 @@ voiced replies to it.  Idempotent."
   (gui:start-agent)
   (gui:new-session!)
   (setf gui:*speak-fn* #'speak-reply)
+  ;; ...and make sure the agent knows the desk package is there.  After the voice link, because
+  ;; until it exists the note would be describing something that cannot answer.
+  (note-desk-once)
   t)
+
+;;; ---- telling the agent what it can do ---------------------------------------------------------
+;;;
+;;; NOT A TOOL.  The first version of this was a "Voice" tool, and it was the wrong shape: the
+;;; agent already has EVAL over a live image, so a capability needs a FUNCTION, not a schema.  See
+;;; desk.lisp for the argument.  What a tool genuinely provides that a function does not is that
+;;; the model is TOLD it exists -- so that half is done here, and it costs one line.
+;;;
+;;; THROUGH THE NOTES, because the notes are already read into every system prompt and are already
+;;; the place this agent keeps what it should not have to rediscover.  Appended once and only if
+;;; absent: a note re-added on every gateway start would grow the prompt a line per restart.
+
+(defparameter *desk-note*
+  "- This desktop is scriptable from `Eval`: the `desk` package wraps what the agent may want to
+  do to the machine it is running on (its own voice, for a start).  Call `(desk:help)` to see
+  the list; each function documents itself.
+- PREFER THE ONES THAT FINISH THE JOB.  `(desk:say-and-wait text)` returns when the sentence is
+  over; `(desk:say-in voice text)` says one line in one voice and puts the old voice back;
+  `(desk:demo-voices)` plays every voice in ONE call; `(desk:listen-for 10)` dictates and returns
+  the transcript.  Calling `desk:say` and then polling `desk:speaking-p` works too, but each poll
+  is a whole agent iteration and there is a budget -- that is how a five-voice demo once ended in
+  `[max-iterations exceeded]` with nothing played."
+  "One line in the agent's notes, so a capability it cannot see is not a capability it does not have.")
+
+(defun note-desk-once ()
+  "Make sure the notes mention the desk package.  Idempotent, and quiet if the notes are unwritable."
+  (ignore-errors
+   (let* ((path (symbol-value (find-symbol "*NOTES-FILE*" "OPERANDI.TOOLS")))
+          (have (and (probe-file path) (uiop:read-file-string path))))
+     (unless (and have (search "(desk:help)" have))
+       (ensure-directories-exist path)
+       (with-open-file (s path :direction :output :if-exists :append :if-does-not-exist :create)
+         (format s "~&~@[~*~%~]## The desktop~%~%~a~%" (and have (plusp (length have))) *desk-note*))))))
 
 (defun app-spec ()
   "The plist the host's warp-app registry wants for the chat: a flat list of messages, no custom
