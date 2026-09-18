@@ -22,7 +22,7 @@
            #:say #:new-session! #:open-session! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
-           #:set-model #:handle-command #:effort-label #:context-budget-k))
+           #:set-model #:handle-command #:effort-label #:context-budget-k #:compact-at-k))
 (in-package #:operandi-gui)
 
 ;; Chat conversations are operandi sessions (reused wholesale: persisted as
@@ -168,6 +168,12 @@ fabricate a value."
   "The context budget in thousands of tokens — the unit the panel and /model both show."
   (round eng:*context-token-budget* 1000))
 
+(defun compact-at-k ()
+  "Where compaction actually fires, in thousands of tokens.  Shown next to the
+   budget because the two differ by the headroom, and a budget that never seems
+   to be reached is otherwise just confusing."
+  (round (eng:compact-threshold) 1000))
+
 (defun set-effort (arg)
   "Set reasoning effort from ARG, or explain what ARG could have been."
   (multiple-value-bind (e ok) (llm:parse-effort arg)
@@ -188,7 +194,8 @@ fabricate a value."
           ((< n 4) "That is too small — under 4k the budget compacts away the turn in progress.")
           ((> n 1000) "That is larger than any context window I can use. Try something under 1000.")
           (t (setf eng:*context-token-budget* (* n 1000))
-             (format nil "Context budget is now ~dk tokens." n)))))
+             (format nil "Context budget is now ~dk tokens; I compact at ~dk."
+                     n (compact-at-k))))))
 
 (defun handle-command (line)
   "Answer a /command, or return NIL if LINE is not one."
@@ -211,8 +218,11 @@ fabricate a value."
       ((string= verb "/context")
        (if (and arg (plusp (length arg)))
            (set-context-budget arg)
-           (format nil "Context budget is `~dk` tokens.~%~%Change it with `/context <k>`, e.g. ~
-                        `/context 24`." (context-budget-k))))
+           (format nil "Context budget is `~dk` tokens; I compact at `~dk`, leaving ~dk of ~
+                        headroom for a big tool result.~%~%Change it with `/context <k>`, e.g. ~
+                        `/context 24`."
+                   (context-budget-k) (compact-at-k)
+                   (- (context-budget-k) (compact-at-k)))))
       ((string= verb "/new")
        (new-session!)
        "Started a fresh conversation.")
