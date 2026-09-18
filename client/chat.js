@@ -59,6 +59,10 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
       '<button type="button" id="chatSetDone">done</button></div>' +
       '<div class="l">Model — now <span id="chatSetNow">…</span></div>' +
       '<div id="chatSetList"></div>' +
+      '<div class="l">Effort — now <span id="chatSetEffortNow">…</span></div>' +
+      '<div id="chatSetEffort"></div>' +
+      '<div class="l">Context — now <span id="chatSetCtxNow">…</span></div>' +
+      '<div id="chatSetCtx"></div>' +
       '<form id="chatSetForm"><input id="chatSetSlug" placeholder="another slug, e.g. vendor/model">' +
       '<button type="submit">set</button></form>' +
       '<div class="r"><button type="button" id="chatSetNew">＋ New conversation</button></div></div>' +
@@ -91,15 +95,24 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
     // what the box ACTUALLY has, rather than assuming what it asked for stuck.
     const CHAT_MODELS = [
       ['z-ai/glm-5.3-flash',         'glm-5.3-flash'],
-      ['deepseek/deepseek-v4-flash', 'deepseek-v4-flash'],
+      ['deepseek/deepseek-v4.1-flash', 'deepseek-v4.1-flash'],
       ['minimax/minimax-m2.7',       'minimax-m2.7'],
       ['anthropic/claude-haiku-4.5', 'claude-haiku-4.5'],
     ];
+    // Effort and context are ENGINE settings, not chat settings, but they belong on the same sheet
+    // because the phone has no other way to reach them.  Same contract as the models above: send
+    // the /command a person would type, then repaint from what the box reports back.
+    const CHAT_EFFORTS = ['off', 'low', 'medium', 'high', 'default'];
+    const CHAT_CTX     = [8, 16, 24, 48, 96];          // thousands of tokens
     const chatSet = chatPanel.querySelector('#chatSet');
     const chatSetNow = chatPanel.querySelector('#chatSetNow');
     const chatSetList = chatPanel.querySelector('#chatSetList');
     const chatSetSlug = chatPanel.querySelector('#chatSetSlug');
-    let curModel = null;
+    const chatSetEffort = chatPanel.querySelector('#chatSetEffort');
+    const chatSetEffortNow = chatPanel.querySelector('#chatSetEffortNow');
+    const chatSetCtx = chatPanel.querySelector('#chatSetCtx');
+    const chatSetCtxNow = chatPanel.querySelector('#chatSetCtxNow');
+    let curModel = null, curEffort = null, curCtx = null;
     const paintModels = () => {
       chatSetList.innerHTML = '';
       for (const pair of CHAT_MODELS) {
@@ -110,9 +123,25 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
         chatSetList.append(b);
       }
     };
+    // one painter for both strips: the values differ, the behaviour does not
+    const paintChoices = (el, values, current, label, cmd) => {
+      el.innerHTML = '';
+      for (const v of values) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = label(v);
+        if (v === current) b.className = 'on';
+        b.onclick = () => warpSend({ a: 'chat', cmd: cmd(v) });
+        el.append(b);
+      }
+    };
+    const paintEfforts = () =>
+      paintChoices(chatSetEffort, CHAT_EFFORTS, curEffort, v => v, v => '/effort ' + v);
+    const paintCtx = () =>
+      paintChoices(chatSetCtx, CHAT_CTX, curCtx, v => v + 'k', v => '/context ' + v);
+
     const openSet = on => {
       chatSet.style.display = on ? 'flex' : 'none';
-      if (on) { chatInput.blur(); warpSend({ a: 'chat', status: true }); paintModels(); }
+      if (on) { chatInput.blur(); warpSend({ a: 'chat', status: true }); paintModels(); paintEfforts(); paintCtx(); }
     };
     chatPanel.querySelector('#chatGear').addEventListener('click', () => openSet(chatSet.style.display !== 'flex'));
     chatPanel.querySelector('#chatSetDone').addEventListener('click', () => openSet(false));
@@ -192,7 +221,9 @@ export function mountChat({ warpCh, makeWarpClient, warpSend, richApps, micBtn, 
       if (d && d.a === 'chat' && d.model !== undefined) {     // the box saying what it actually has
         curModel = d.model; chatSetNow.textContent = d.model;
         if (d.speaking !== undefined) chatSpeak.checked = !!d.speaking;
-        paintModels(); return;
+        if (d.effort !== undefined) { curEffort = d.effort; chatSetEffortNow.textContent = d.effort; }
+        if (d.context !== undefined) { curCtx = d.context; chatSetCtxNow.textContent = d.context + 'k'; }
+        paintModels(); paintEfforts(); paintCtx(); return;
       }
       if (d && d.a === 'chat' && d.dictate !== undefined) {   // live transcript -> the input box
         // ...but only while the box still holds exactly what dictation last put there.  The moment

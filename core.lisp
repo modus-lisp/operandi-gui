@@ -21,7 +21,7 @@
            #:say #:new-session! #:open-session! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
-           #:set-model #:handle-command))
+           #:set-model #:handle-command #:effort-label #:context-budget-k))
 (in-package #:operandi-gui)
 
 ;; Chat conversations are operandi sessions (reused wholesale: persisted as
@@ -154,6 +154,41 @@ fabricate a value."
             (t (llm:use-openrouter :model old)
                (format nil "~a did not answer, so I kept ~a.~@[~%~%~a~]" slug old reason))))))
 
+;;; Reasoning effort and the context budget are engine settings, not chat settings, so they live
+;;; where the engine keeps them (LLM:*LLM-EFFORT*, ENG:*CONTEXT-TOKEN-BUDGET*) and these commands
+;;; only read and write those places.  The TUI already spells effort `/effort'; the same word here
+;;; means the same thing, because an operator who learned one should not have to learn the other.
+
+(defun effort-label ()
+  "The current reasoning effort as the word a person would type."
+  (if llm:*llm-effort* (string-downcase (symbol-name llm:*llm-effort*)) "default"))
+
+(defun context-budget-k ()
+  "The context budget in thousands of tokens — the unit the panel and /model both show."
+  (round eng:*context-token-budget* 1000))
+
+(defun set-effort (arg)
+  "Set reasoning effort from ARG, or explain what ARG could have been."
+  (multiple-value-bind (e ok) (llm:parse-effort arg)
+    (cond ((not ok)
+           (format nil "`~a` is not an effort. Try `off`, `low`, `medium`, `high`, or `default`."
+                   arg))
+          (t (setf llm:*llm-effort* e)
+             (format nil "Effort is now ~a." (effort-label))))))
+
+(defun set-context-budget (arg)
+  "Set the context budget from ARG, read as thousands of tokens (`24` and `24k` both mean 24000).
+   Bounded below because a budget under a few thousand tokens compacts away the turn in progress,
+   and above because the point of the number is to stay under the model's window."
+  (let* ((txt (string-right-trim "kK" (string-trim " " arg)))
+         (n (ignore-errors (parse-integer txt))))
+    (cond ((null n) (format nil "`~a` is not a number of thousands of tokens. Try `/context 24`."
+                            arg))
+          ((< n 4) "That is too small — under 4k the budget compacts away the turn in progress.")
+          ((> n 1000) "That is larger than any context window I can use. Try something under 1000.")
+          (t (setf eng:*context-token-budget* (* n 1000))
+             (format nil "Context budget is now ~dk tokens." n)))))
+
 (defun handle-command (line)
   "Answer a /command, or return NIL if LINE is not one."
   (let* ((s (string-trim '(#\Space #\Tab) line))
@@ -167,11 +202,23 @@ fabricate a value."
            (set-model arg)
            (format nil "Model is `~a`.~%~%Change it with `/model <slug>` — I ping the model and keep ~
                         the old one if it doesn't answer." *model*)))
+      ((string= verb "/effort")
+       (if (and arg (plusp (length arg)))
+           (set-effort arg)
+           (format nil "Effort is `~a`.~%~%Change it with `/effort off|low|medium|high|default`."
+                   (effort-label))))
+      ((string= verb "/context")
+       (if (and arg (plusp (length arg)))
+           (set-context-budget arg)
+           (format nil "Context budget is `~dk` tokens.~%~%Change it with `/context <k>`, e.g. ~
+                        `/context 24`." (context-budget-k))))
       ((string= verb "/new")
        (new-session!)
        "Started a fresh conversation.")
       ((member verb '("/help" "/?") :test #'string=)
        (format nil "- `/model [slug]` — show or switch the model~%~
+                    - `/effort [lvl]` — reasoning effort: off, low, medium, high, default~%~
+                    - `/context [k]` — context budget in thousands of tokens~%~
                     - `/new` — start a fresh conversation~%~
                     - `/help` — this"))
       (t (format nil "I don't know `~a`. Try `/help`." verb)))))

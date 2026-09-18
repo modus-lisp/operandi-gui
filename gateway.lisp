@@ -182,12 +182,16 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
               ;; than what it last sent
               ((nth-value 1 (gethash "status" o))
                (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+                                               "effort" (gui:effort-label)
+                                               "context" (gui:context-budget-k)
                                                "speaking" (if gui:*speak-enabled* t nil))))
                t)
               ;; a settings tap is a /command typed for you — same handler, same transcript entry
               ((stringp (gethash "cmd" o))
                (gui:say (gethash "cmd" o))
                (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+                                               "effort" (gui:effort-label)
+                                               "context" (gui:context-budget-k)
                                                "speaking" (if gui:*speak-enabled* t nil))))
                t))))
       (error () nil))))
