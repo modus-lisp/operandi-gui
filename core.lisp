@@ -259,7 +259,12 @@ fabricate a value."
           (*think*
            (bt:with-lock-held (*qlock*)
              (setf *steer* (nconc *steer* (list s))))
-           (%think! "↪ steering…"))
+           ;; SPLIT THE ROLLUP.  The :YOU row for this message was appended just above,
+           ;; so freezing the current row here and opening a new one puts the steer
+           ;; BETWEEN the calls it interrupted and the calls it caused.  Left as one
+           ;; row, the live status keeps updating above the message that redirected it,
+           ;; which reads as though the steer did nothing.
+           (%think-open! "↪ steering…"))
           (t
            (bt:with-lock-held (*qlock*)
              (setf *queue* (nconc *queue* (list s)))
@@ -272,13 +277,55 @@ fabricate a value."
 ;;; place at the end of the turn (same id -> a :changed delta), so saying more
 ;;; costs nothing new: rewrite the SAME row as the work happens.
 
-(defun %think! (fmt &rest args)
-  "Rewrite the in-flight thinking row.  A no-op when no turn is running, so a
-   stray hook from a finished run cannot resurrect a row or clobber a reply."
+(defvar *think-head* "" "The one-line status: what the turn is doing RIGHT NOW.")
+(defvar *tool-log* '() "What it has already done this leg, newest first.")
+(defparameter *tool-log-keep* 40
+  "How many calls the detail list keeps.  The row's whole text is resent on every
+   update, so an unbounded log would put a growing payload on the data channel
+   once per tool call — and forty is already more than anyone reads on a phone.")
+
+(defun %think-repaint ()
+  "Compose the row: status line first, detail below.  FIRST is deliberate — the
+   collapsed row shows only its first line, so the live status has to be that
+   line, and the detail is what tapping reveals."
   (let ((m *think*))
     (when m
-      (bt:with-lock-held (*lock*)
-        (setf (msg-text m) (apply #'format nil fmt args))))))
+      (let ((text (if *tool-log*
+                      (format nil "~a~%~{~a~%~}" *think-head*
+                              (reverse (subseq *tool-log*
+                                               0 (min *tool-log-keep* (length *tool-log*)))))
+                      *think-head*)))
+        (bt:with-lock-held (*lock*) (setf (msg-text m) text))))))
+
+(defun %think! (fmt &rest args)
+  "Set the status line.  A no-op when no turn is running, so a stray hook from a
+   finished run cannot resurrect a row or clobber a reply."
+  (setf *think-head* (apply #'format nil fmt args))
+  (%think-repaint))
+
+(defun %tool-log! (fmt &rest args)
+  "Add one finished call to the detail list."
+  (push (apply #'format nil fmt args) *tool-log*)
+  (%think-repaint))
+
+(defun %think-open! (head)
+  "Start a FRESH rollup row with HEAD as its status, leaving the previous row
+   frozen where it is.  Used when a steering message arrives: the calls before it
+   and the calls after it are different answers to different instructions, and
+   rolling them into one line puts the work above the words that caused it."
+  (setf *tool-log* '() *think-head* head)
+  (setf *think* (add-msg "operandi" head :think)))
+
+(defun %arg-detail (args)
+  "Like %ARG-BRIEF but roomier — the detail list is read deliberately, so it can
+   afford the whole path or most of a command."
+  (let ((v (and (hash-table-p args)
+                (or (gethash "path" args) (gethash "file_path" args)
+                    (gethash "pattern" args) (gethash "command" args)
+                    (gethash "query" args) (gethash "url" args)))))
+    (when (stringp v)
+      (let ((one (substitute #\Space #\Newline v)))
+        (if (> (length one) 120) (concatenate 'string (subseq one 0 120) "...") one)))))
 
 (defun %arg-brief (args)
   "The one argument worth showing from a tool call -- the path, pattern or command
@@ -309,9 +356,18 @@ fabricate a value."
                                     (and (plusp calls)
                                          (format nil "~d tool call~:p" calls)))))
                        hooks:*pre-tool-hooks*))
+               ;; The detail line is written on POST, not PRE, because that is when the
+               ;; outcome exists — how long it took and whether it worked is most of what
+               ;; makes the list worth opening.
                (hooks:*post-tool-hooks*
                  (cons (lambda (name args result error ms)
-                         (declare (ignore args result ms))
+                         (%tool-log! "~2,' d. ~a~@[ ~a~] ~a"
+                                     calls name (%arg-detail args)
+                                     (cond (error (format nil "— FAILED: ~a" error))
+                                           ((stringp result)
+                                            (format nil "— ~:d chars~@[, ~a ms~]"
+                                                    (length result) ms))
+                                           (t (format nil "— done~@[ in ~a ms~]" ms))))
                          (when error (%think! "⚠ ~a failed — recovering…" name)))
                        hooks:*post-tool-hooks*))
                ;; Compaction is the longest silent pause in a run: it summarises the
@@ -425,6 +481,7 @@ fabricate a value."
                         do (bt:condition-wait *qcv* *qlock*))
                   (and *queue* (pop *queue*)))))
       (when text
+        (setf *tool-log* '() *think-head* "…thinking…")
         (setf *think* (add-msg "operandi" "…thinking…" :think))
         (multiple-value-bind (reply kind)
             (handler-case (values (answer text) :bot)
