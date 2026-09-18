@@ -14,6 +14,7 @@
   (:use #:cl)
   (:local-nicknames (#:w #:warp) (#:eng #:operandi.engine)
                     (#:llm #:operandi.llm) (#:tools #:operandi.tools) (#:bt #:bordeaux-threads)
+                    (#:hooks #:operandi.hooks)
                     (#:session #:operandi.session) (#:jzon #:com.inuoe.jzon))
   (:export #:*model* #:*system-prompt* #:*tool-names*
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
@@ -240,18 +241,81 @@ fabricate a value."
               (setf *queue* (nconc *queue* (list s)))
               (bt:condition-notify *qcv*)))))))
 
+;;; --------------------------- live status ------------------------------
+;;; A turn can run for minutes across dozens of tool calls, and the panel said
+;;; "...thinking..." for all of it -- indistinguishable from a hang, which is the
+;;; thing a chat UI most needs to not look like.  The row is already updated in
+;;; place at the end of the turn (same id -> a :changed delta), so saying more
+;;; costs nothing new: rewrite the SAME row as the work happens.
+
+(defun %think! (fmt &rest args)
+  "Rewrite the in-flight thinking row.  A no-op when no turn is running, so a
+   stray hook from a finished run cannot resurrect a row or clobber a reply."
+  (let ((m *think*))
+    (when m
+      (bt:with-lock-held (*lock*)
+        (setf (msg-text m) (apply #'format nil fmt args))))))
+
+(defun %arg-brief (args)
+  "The one argument worth showing from a tool call -- the path, pattern or command
+   -- trimmed to fit a phone.  Deliberately not the whole argument hash: this is a
+   status line, and a Bash heredoc would bury the panel."
+  (let ((v (and (hash-table-p args)
+                (or (gethash "path" args) (gethash "file_path" args)
+                    (gethash "pattern" args) (gethash "command" args)
+                    (gethash "query" args) (gethash "url" args)))))
+    (when (stringp v)
+      (let* ((one (substitute #\Space #\Newline v))
+             (cut (if (> (length one) 48)
+                      (concatenate 'string (subseq one 0 48) "...")
+                      one)))
+        cut))))
+
 (defun answer (text)
   "Run one engine turn threaded onto the live session's history, and persist it."
-  (let ((base (and *session* (session:session-history *session*))))
+  (let ((base (and *session* (session:session-history *session*)))
+        (calls 0)
+        (toks 0))
     (multiple-value-bind (reply hist)
-        (eng:run text
+        (let* ((hooks:*pre-tool-hooks*
+                 (cons (lambda (name args)
+                         (incf calls)
+                         (let ((b (%arg-brief args)))
+                           (%think! "⚙ ~a~@[ ~a~]~@[ · ~a~]" name b
+                                    (and (plusp calls)
+                                         (format nil "~d tool call~:p" calls)))))
+                       hooks:*pre-tool-hooks*))
+               (hooks:*post-tool-hooks*
+                 (cons (lambda (name args result error ms)
+                         (declare (ignore args result ms))
+                         (when error (%think! "⚠ ~a failed — recovering…" name)))
+                       hooks:*post-tool-hooks*))
+               ;; Compaction is the longest silent pause in a run: it summarises the
+               ;; whole span with a second model call.  Name it, or it reads as a hang.
+               (eng:*on-compact*
+                 (lambda (before after path)
+                   (declare (ignore path))
+                   (%think! "🗜 compacting context ~dk → ~dk…"
+                            (round before 1000) (round after 1000))))
+               ;; Streamed reasoning, throttled: every token would be a delta to the
+               ;; phone, so only redraw about once per 800 characters.  The count is
+               ;; the point -- it moves, which is what says running rather than wedged.
+               (eng:*on-token*
+                 (lambda (chunk)
+                   (incf toks (length chunk))
+                   (when (> toks 800)
+                     (setf toks 0)
+                     (%think! "…thinking~@[ · ~a so far~]"
+                              (and (plusp calls)
+                                   (format nil "~d tool call~:p" calls)))))))
+          (eng:run text
                  ;; :history NIL on the first turn lets the engine seat the system
                  ;; prompt; thereafter we thread the accumulated history + new message.
                  :history (when base
                             (append base (list (llm:ht "role" "user" "content" text))))
                  :system *system-prompt*
                  :tool-names (or *tool-names* (tools:default-tools))
-                 :verbose nil)
+                 :verbose nil))
       (when *session*
         (setf (gethash :history *session*) hist)
         (incf (gethash :turns *session*))
