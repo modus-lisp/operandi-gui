@@ -131,6 +131,12 @@ fabricate a value."
 
 ;;; ------------------------------- the agent ----------------------------
 (defvar *queue* '()) (defvar *qlock* (bt:make-lock "chat-q")) (defvar *qcv* (bt:make-condition-variable))
+(defvar *steer* '()
+  "Words written while a turn is ALREADY running.  They do not wait for it —
+   ENG:*STEER-FN* drains this between iterations and appends them to the running
+   conversation, so they redirect the work in flight.  Queuing them instead is
+   what made \"continue\" the only usable thing to say: by the time a queued
+   message is read, the turn you wanted to change is over.")
 (defvar *worker* nil) (defvar *running* nil) (defvar *think* nil "the live 'thinking' msg, or NIL.")
 
 ;; Voice output is the host's to provide (the gateway routes it to the desktop's chord voice; a
@@ -244,12 +250,20 @@ fabricate a value."
       (let ((cmd (and (char= (char s 0) #\/)
                       (handler-case (handle-command s)
                         (serious-condition (e) (format nil "That went wrong: ~a" e))))))
-        (if cmd
-            ;; the GUI is answering, so it lands as a reply and nothing is queued for the engine
-            (add-msg "operandi" cmd :bot)
-            (bt:with-lock-held (*qlock*)
-              (setf *queue* (nconc *queue* (list s)))
-              (bt:condition-notify *qcv*)))))))
+        (cond
+          ;; the GUI is answering, so it lands as a reply and nothing is queued for the engine
+          (cmd (add-msg "operandi" cmd :bot))
+          ;; A turn is in flight: STEER it rather than queue behind it.  *THINK* is
+          ;; the live turn's own row, so it is exactly "is the worker busy" without
+          ;; a second flag that could disagree with it.
+          (*think*
+           (bt:with-lock-held (*qlock*)
+             (setf *steer* (nconc *steer* (list s))))
+           (%think! "↪ steering…"))
+          (t
+           (bt:with-lock-held (*qlock*)
+             (setf *queue* (nconc *queue* (list s)))
+             (bt:condition-notify *qcv*))))))))
 
 ;;; --------------------------- live status ------------------------------
 ;;; A turn can run for minutes across dozens of tool calls, and the panel said
@@ -310,6 +324,15 @@ fabricate a value."
                ;; Streamed reasoning, throttled: every token would be a delta to the
                ;; phone, so only redraw about once per 800 characters.  The count is
                ;; the point -- it moves, which is what says running rather than wedged.
+               ;; Hand the engine anything said since the last iteration.  One string,
+               ;; blank-joined, so two quick messages arrive as one turn rather than
+               ;; two consecutive user turns the model has to reconcile.
+               (eng:*steer-fn*
+                 (lambda ()
+                   (let ((pending (bt:with-lock-held (*qlock*)
+                                    (prog1 *steer* (setf *steer* '())))))
+                     (when pending
+                       (format nil "~{~A~^~%~%~}" pending)))))
                (eng:*on-token*
                  (lambda (chunk)
                    (incf toks (length chunk))
@@ -412,6 +435,15 @@ fabricate a value."
               (setf (msg-text *think*) reply
                     (slot-value *think* 'kind) kind))
             (setf *think* nil)
+            ;; A steer written in the gap between the engine's last drain and the
+            ;; turn ending has nowhere to land — it must not evaporate.  Promote it
+            ;; to the turn queue so it starts the next turn instead.
+            (let ((late (bt:with-lock-held (*qlock*)
+                          (prog1 *steer* (setf *steer* '())))))
+              (when late
+                (bt:with-lock-held (*qlock*)
+                  (setf *queue* (nconc *queue* late))
+                  (bt:condition-notify *qcv*))))
             ;; voice a real answer (not an error) if the operator turned it on.  We hand the RAW
             ;; reply + its row id; the host splits into sentences, cleans each for the voice, and
             ;; drives the highlight (payload.js re-splits the SAME raw text to find the spans).
