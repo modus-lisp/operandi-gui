@@ -175,6 +175,9 @@ is the cheap half of what a tool definition buys, without the cost of the other 
                 (symbol-name s)
                 (mapcar #'symbol-name
                         (remove-if (lambda (x) (member x lambda-list-keywords))
-                                   (sb-introspect:function-lambda-list s)))
+                                   ;; argument names are a nicety in a help listing; an
+                                   ;; implementation without SB-INTROSPECT just shows the names
+                                   #+sbcl (sb-introspect:function-lambda-list s)
+                                   #-sbcl nil))
                 (and doc (substitute #\Space #\Newline doc))))))
   (values))

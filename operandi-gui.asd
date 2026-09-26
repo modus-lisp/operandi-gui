@@ -25,13 +25,13 @@
 
 (defsystem "operandi-gui/serve"
   :description "Standalone HTTP host for operandi-gui: the browser page + a plain-WebSocket warp link."
-  :depends-on ("operandi-gui" "warp-dom/serve")
+  :depends-on ("operandi-gui" "warp-dom/serve" "babel")
   :serial t
   :components ((:file "serve")))
 
 (defsystem "operandi-gui/gateway"
   :description "Host operandi-gui on the glass WebRTC gateway: chord voice + stave dictation + karaoke,
 routed to the desktop over its seat socket and to the phone over a host callback."
-  :depends-on ("operandi-gui" "sb-introspect")
+  :depends-on ("operandi-gui" (:feature :sbcl "sb-introspect"))
   :serial t
   :components ((:file "desk") (:file "gateway")))

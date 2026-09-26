@@ -8,14 +8,6 @@
 
 (in-package #:operandi-gui)
 
-;; warp-dom is only needed by this server, so its nickname is added here (at load of
-;; the :operandi-gui/serve system) rather than on the core package — core loads in a
-;; process that may not have warp-dom at all.
-;; :compile-toplevel too — COMPILE-FILE reads `wd::…` forms below and must resolve the
-;; nickname at READ time, which is during compilation, not just at load.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (sb-ext:add-package-local-nickname '#:wd '#:warp-dom (find-package '#:operandi-gui)))
-
 (defparameter *port* (or (ignore-errors (parse-integer (uiop:getenv "OPERANDI_CHAT_PORT"))) 8790))
 
 ;;; ------------------------------- the page -----------------------------
@@ -175,53 +167,53 @@ else showPicker();
     (if (plusp n)
         (let ((buf (make-array n :element-type '(unsigned-byte 8))))
           (when (= n (read-sequence buf stream))
-            (sb-ext:octets-to-string buf :external-format :utf-8)))
+            (babel:octets-to-string buf :encoding :utf-8 :errorp nil)))
         "")))
 
 (defun run-list-consumer (stream)
   "Seat a warp-dom consumer for the message list on this WebSocket."
   (let* ((lock (bt:make-lock))
-         (ch (wd:open-channel *proj*
-                              :send (lambda (frame) (bt:with-lock-held (lock) (wd::ws-send-text stream frame)))
+         (ch (warp-dom:open-channel *proj*
+                              :send (lambda (frame) (bt:with-lock-held (lock) (warp-dom::ws-send-text stream frame)))
                               :view 'chat-view :invoker :allowlist :budget 200000 :rows 200 :hz 8
                               :name "chat")))
     (unwind-protect
-         (loop for text = (wd::ws-read-message stream) while text
-               do (wd:channel-receive ch text))
-      (wd:channel-close ch))))
+         (loop for text = (warp-dom::ws-read-message stream) while text
+               do (warp-dom:channel-receive ch text))
+      (warp-dom:channel-close ch))))
 
 (defun serve-connection (conn)
   (let ((stream (sb-bsd-sockets:socket-make-stream conn :input t :output t
                                                         :element-type '(unsigned-byte 8))))
     (unwind-protect
-         (multiple-value-bind (method path headers) (wd::read-http-request stream)
+         (multiple-value-bind (method path headers) (warp-dom::read-http-request stream)
            (cond
              ((null method))
              ((and (string= method "GET") (eql 0 (search "/warp" path)))
-              (when (wd::ws-accept stream headers) (run-list-consumer stream)))
+              (when (warp-dom::ws-accept stream headers) (run-list-consumer stream)))
              ((and (string= method "GET") (eql 0 (search "/client.js" path)))
-              (wd::http-respond stream "200 OK" "application/javascript; charset=utf-8"
-                                (wd::client-file "client.js")))
+              (warp-dom::http-respond stream "200 OK" "application/javascript; charset=utf-8"
+                                (warp-dom::client-file "client.js")))
              ((and (string= method "POST") (eql 0 (search "/say" path)))
               (let ((body (read-body stream headers)))
                 (when (and body (plusp (length body))) (ignore-errors (say body))))
-              (wd::http-respond stream "200 OK" "text/plain" "ok"))
+              (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
              ((and (string= method "GET") (eql 0 (search "/sessions" path)))
-              (wd::http-respond stream "200 OK" "application/json; charset=utf-8"
+              (warp-dom::http-respond stream "200 OK" "application/json; charset=utf-8"
                                 (or (ignore-errors (sessions-json)) "[]")))
              ((and (string= method "POST") (eql 0 (search "/new" path)))
               (read-body stream headers)
               (new-session!)
-              (wd::http-respond stream "200 OK" "text/plain" "ok"))
+              (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
              ((and (string= method "POST") (eql 0 (search "/open" path)))
               (let* ((id (string-trim '(#\Space #\Newline #\Return #\Tab)
                                       (or (read-body stream headers) "")))
                      (ok (and (plusp (length id)) (ignore-errors (open-session! id)))))
-                (wd::http-respond stream (if ok "200 OK" "404 Not Found")
+                (warp-dom::http-respond stream (if ok "200 OK" "404 Not Found")
                                   "text/plain" (if ok "ok" "no such session"))))
              ((string= method "GET")
-              (wd::http-respond stream "200 OK" "text/html; charset=utf-8" *page*))
-             (t (wd::http-respond stream "405 Method Not Allowed" "text/plain" "no"))))
+              (warp-dom::http-respond stream "200 OK" "text/html; charset=utf-8" *page*))
+             (t (warp-dom::http-respond stream "405 Method Not Allowed" "text/plain" "no"))))
       (ignore-errors (close stream))
       (ignore-errors (sb-bsd-sockets:socket-close conn)))))
 
