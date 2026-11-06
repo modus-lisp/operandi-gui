@@ -496,11 +496,17 @@ fabricate a value."
         (multiple-value-bind (reply kind)
             (handler-case (values (answer text) :bot)
               (serious-condition (e) (values (format nil "Something went wrong: ~A" e) :err)))
-          ;; replace the thinking row's text in place (same id -> a :changed delta)
-          (let ((mid (msg-id *think*)))
-            (bt:with-lock-held (*lock*)
-              (setf (msg-text *think*) reply
-                    (slot-value *think* 'kind) kind))
+          ;; A turn that used tools keeps its row, the status now a summary and the calls still
+          ;; under it, and the reply is a row of its own; a turn that did not is just its reply,
+          ;; written over the thinking row (same id -> a :changed delta).
+          (let ((mid (if *tool-log*
+                         (let ((n (length *tool-log*)))
+                           (%think! "⚙ ~d tool call~:p" n)
+                           (msg-id (add-msg "operandi" reply kind)))
+                         (progn (bt:with-lock-held (*lock*)
+                                  (setf (msg-text *think*) reply
+                                        (slot-value *think* 'kind) kind))
+                                (msg-id *think*)))))
             (setf *think* nil)
             ;; A steer written in the gap between the engine's last drain and the
             ;; turn ending has nowhere to land — it must not evaporate.  Promote it

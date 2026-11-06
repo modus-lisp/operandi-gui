@@ -40,6 +40,10 @@
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
  #rows li.think .dt{display:none}
+ body.notools #rows li.think{display:none}
+ #tools{background:none;color:#9fb4c8;border:1px solid #2a3644;border-radius:16px;
+   padding:5px 12px;font:12px/1 inherit;cursor:pointer;margin-left:auto;margin-right:8px}
+ body:not(.notools) #tools{background:#1b2430;color:#dce4ec}
  #rows li.think.open .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
    font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
  #rows li.think.more{cursor:pointer}
@@ -70,6 +74,7 @@
 </style></head><body>
 <div id=wrap>
  <header>operandi <small id=st>· connecting…</small>
+   <button id=tools type=button title='show or hide the tool calls'>Tools</button>
    <button id=sess type=button>Sessions</button></header>
  <ul id=rows></ul><ul id=menu></ul>
  <form id=f autocomplete=off>
@@ -124,6 +129,10 @@ function decorate(){                             // idempotent: warp repaints ro
     if(v.innerHTML!==html)v.innerHTML=html;      // guard so we don't thrash the DOM
   });
 }
+const toolsBtn=document.getElementById('tools');   // show/hide the tool rows; the choice is kept
+function setTools(on){document.body.classList.toggle('notools',!on);try{localStorage.setItem('tools',on?'1':'0');}catch(_){}}
+setTools((()=>{try{return localStorage.getItem('tools')!=='0';}catch(_){return true;}})());
+toolsBtn.onclick=()=>setTools(document.body.classList.contains('notools'));
 rowsEl.addEventListener('click',e=>{             // delegated: warp replaces rows wholesale
   const li=e.target.closest&&e.target.closest('li.think.more'); if(!li)return;
   li.dataset.open=li.dataset.open==='1'?'':'1'; decorate();
