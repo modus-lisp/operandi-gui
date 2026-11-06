@@ -9,6 +9,8 @@
 (in-package #:operandi-gui)
 
 (defparameter *port* (or (ignore-errors (parse-integer (uiop:getenv "OPERANDI_CHAT_PORT"))) 8790))
+(defparameter *host* (or (uiop:getenv "OPERANDI_CHAT_HOST") "127.0.0.1")
+  "The address to listen on.  Loopback by default: the page drives an agent with tools.")
 
 ;;; ------------------------------- the page -----------------------------
 (defparameter *page*
@@ -217,12 +219,12 @@ else showPicker();
       (ignore-errors (close stream))
       (ignore-errors (sb-bsd-sockets:socket-close conn)))))
 
-(defun start (&key (port *port*) (model *model*))
+(defun start (&key (host *host*) (port *port*) (model *model*))
   (start-agent :model model)   ; core: LLM backend + the single worker thread
   ;; No session at boot: the browser shows the picker (resume a chat, or start new).
   (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
-    (sb-bsd-sockets:socket-bind sock #(127 0 0 1) port)
+    (sb-bsd-sockets:socket-bind sock (sb-bsd-sockets:make-inet-address host) port)
     (sb-bsd-sockets:socket-listen sock 8)
     (setf *sock* sock
           *accept* (bt:make-thread
@@ -235,7 +237,7 @@ else showPicker();
                                               :name "chat-conn"))
                           (serious-condition () (return)))))
                     :name "chat-accept")))
-  (format t "~&operandi chat :: http://127.0.0.1:~d/  (model ~a)~%" port model)
+  (format t "~&operandi chat :: http://~a:~d/  (model ~a)~%" host port *model*)
   (force-output)
   port)
 

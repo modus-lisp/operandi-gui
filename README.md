@@ -32,7 +32,10 @@ On the phone surface it also does voice, both ways, on the from-scratch audio st
 sbcl --non-interactive --load bin/standalone.lisp     # serves http://127.0.0.1:8790/
 ```
 
-`OPERANDI_CHAT_PORT` / `OPERANDI_CHAT_MODEL` override the defaults.
+`OPERANDI_CHAT_PORT` / `OPERANDI_CHAT_MODEL` override the defaults. `OPERANDI_CHAT_URL` talks to a
+local OpenAI-compatible server instead of OpenRouter (`http://127.0.0.1:8080/v1/chat/completions`;
+with no model named it asks the server what it serves), and `OPERANDI_CHAT_HOST` sets the address
+to listen on (default `127.0.0.1`: anyone who can reach the page can drive the agent's tools).
 
 ## Systems
 

@@ -20,7 +20,7 @@
 (defpackage #:operandi-gui.gateway
   (:use #:cl)
   (:local-nicknames (#:gui #:operandi-gui) (#:llm #:operandi.llm)
-                    (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
+                    (#:json #:json-simple) (#:bt #:bordeaux-threads))
   ;; VOICE is exported because desk.lisp calls it: the desk functions are the agent's face on this
   ;; link, and they must not reach around it into glass.
   (:export #:ensure-ready #:app-spec #:note-peer #:handle-control #:voice))
@@ -79,7 +79,7 @@ the moment a newer reply or a hush bumps *SPEAK-GEN*."
 ;;; DICTATION ONLY — the operator reviews the box and taps Send; nothing is auto-said.
 (defvar *listen-gen* 0 "bumped on each listen start/stop; the poll thread bails when it changes.")
 
-(defun notify-dictate (text) (notify (jzon:stringify (llm:ht "a" "chat" "dictate" text))))
+(defun notify-dictate (text) (notify (json:stringify (llm:ht "a" "chat" "dictate" text))))
 
 (defun listen-start ()
   "Clear + start the ear and poll its (display-ready) transcript into the phone's box until a
@@ -165,7 +165,7 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
                  (search "\"listen\"" text) (search "\"clear\"" text)
                  (search "\"status\"" text) (search "\"cmd\"" text)))
     (handler-case
-        (let ((o (jzon:parse text)))
+        (let ((o (json:parse text)))
           (when (and (hash-table-p o) (equal (gethash "a" o) "chat"))
             (cond
               ((stringp (gethash "say" o)) (gui:say (gethash "say" o)) t)
@@ -181,7 +181,7 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
               ;; the settings panel asking what is currently set, so it can show the truth rather
               ;; than what it last sent
               ((nth-value 1 (gethash "status" o))
-               (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+               (notify (json:stringify (llm:ht "a" "chat" "model" gui:*model*
                                                "effort" (gui:effort-label)
                                                "context" (gui:context-budget-k)
                                                "speaking" (if gui:*speak-enabled* t nil))))
@@ -189,7 +189,7 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
               ;; a settings tap is a /command typed for you — same handler, same transcript entry
               ((stringp (gethash "cmd" o))
                (gui:say (gethash "cmd" o))
-               (notify (jzon:stringify (llm:ht "a" "chat" "model" gui:*model*
+               (notify (json:stringify (llm:ht "a" "chat" "model" gui:*model*
                                                "effort" (gui:effort-label)
                                                "context" (gui:context-budget-k)
                                                "speaking" (if gui:*speak-enabled* t nil))))

@@ -19,7 +19,7 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("warp" "operandi" "bordeaux-threads")
+  :depends-on ("warp" "operandi" "json-simple" "bordeaux-threads")
   :serial t
   :components ((:file "core")))
 

@@ -15,7 +15,7 @@
   (:local-nicknames (#:w #:warp) (#:eng #:operandi.engine)
                     (#:llm #:operandi.llm) (#:tools #:operandi.tools) (#:bt #:bordeaux-threads)
                     (#:hooks #:operandi.hooks)
-                    (#:session #:operandi.session) (#:jzon #:com.inuoe.jzon))
+                    (#:session #:operandi.session) (#:json #:json-simple))
   (:export #:*model* #:*system-prompt* #:*tool-names*
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
            #:*proj* #:chat-projection
@@ -32,7 +32,10 @@
       (namestring (merge-pathnames ".operandi/chat-sessions/" (user-homedir-pathname))))
 
 ;;; ------------------------------- config -------------------------------
-(defparameter *model* (or (uiop:getenv "OPERANDI_CHAT_MODEL") "z-ai/glm-5.3-flash")
+(defparameter *chat-url* (uiop:getenv "OPERANDI_CHAT_URL")
+  "A local OpenAI-compatible chat endpoint (llama.cpp, illatio: http://host:port/v1/chat/completions)
+   to talk to instead of OpenRouter.  NIL = OpenRouter.")
+(defparameter *model* (or (uiop:getenv "OPERANDI_CHAT_MODEL") (unless *chat-url* "z-ai/glm-5.3-flash"))
   "The model a fresh chat starts on.  Changed live with /model — which pings the new one and keeps
    the old if it does not answer, so the default here is a starting point and not a commitment.")
 (defparameter *tool-names* nil "engine tool allow-list; NIL = full toolset.")
@@ -101,7 +104,7 @@ fabricate a value."
 
 (defun sessions-json ()
   "The saved chats as JSON for the picker: newest first, each {id,title,turns}."
-  (jzon:stringify
+  (json:stringify
    (coerce
     (loop for (id turns first) in (session:list-sessions)
           collect (llm:ht "id" id
@@ -148,17 +151,24 @@ fabricate a value."
 ;;; Typed into the same box as everything else, because on a phone that box is the only input this
 ;;; app has.  A line beginning with / is the GUI's own and never reaches the agent.
 
+(defun use-model (slug)
+  "Point the engine at SLUG: on the local server when *CHAT-URL* is set (SLUG NIL asks it what it
+   serves), else on OpenRouter."
+  (if *chat-url*
+      (llm:set-backend-llama! :url *chat-url* :model slug)
+      (llm:set-backend-openrouter! :model slug)))
+
 (defun set-model (slug)
   "Switch the agent to SLUG — but PROVE it first.  ENG:PREFLIGHT-MODEL sends a one-token ping and
    reads the provider's own reason, so a typo, a retired slug, or a provider-allowlist miss is
    caught here rather than turning every later turn into a blank reply.  A switch that does not
    preflight is rolled back: better the model you had than one that cannot answer."
   (let ((old *model*))
-    (llm:use-openrouter :model slug)
+    (use-model slug)
     (multiple-value-bind (ok reason) (eng:preflight-model)
       (cond (ok (setf *model* slug)
                 (format nil "Model is now ~a." slug))
-            (t (llm:use-openrouter :model old)
+            (t (use-model old)
                (format nil "~a did not answer, so I kept ~a.~@[~%~%~a~]" slug old reason))))))
 
 ;;; Reasoning effort and the context budget are engine settings, not chat settings, so they live
@@ -510,7 +520,9 @@ fabricate a value."
 ;;; ------------------------------ lifecycle -----------------------------
 (defun start-agent (&key (model *model*))
   "Configure the LLM backend and start the single worker thread (idempotent)."
-  (when model (llm:use-openrouter :model model))
+  (when (or model *chat-url*)
+    (use-model model)
+    (setf *model* llm:*llm-model*))
   (ensure-directories-exist session:*sessions-dir*)
   (unless (and *worker* (bt:thread-alive-p *worker*))
     (setf *running* t
