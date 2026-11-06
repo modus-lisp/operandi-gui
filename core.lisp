@@ -324,8 +324,12 @@ fabricate a value."
 (defparameter *reason-clip* 1500 "How much of one stretch of reasoning a row keeps.")
 
 (defun %clip-reason (text)
-  (let ((r (string-trim '(#\Space #\Newline #\Tab #\Return) text)))
-    (format nil "✻ ~a" (if (> (length r) *reason-clip*) (concatenate 'string (subseq r 0 *reason-clip*) "…") r))))
+  "One stretch of reasoning as one log entry.  Entries are lines, so its own line breaks travel as
+   U+2028 -- the page turns those back into breaks, and a numbered list inside a thought can't be
+   mistaken for the calls around it."
+  (let* ((r (string-trim '(#\Space #\Newline #\Tab #\Return) (remove #\Return text)))
+         (r (if (> (length r) *reason-clip*) (concatenate 'string (subseq r 0 *reason-clip*) "…") r)))
+    (format nil "✻ ~a" (substitute (code-char #x2028) #\Newline r))))
 
 (defun %reason-flush ()
   "Close the reasoning streaming in now into one log entry."

@@ -40,6 +40,12 @@
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
  #rows li.think .dt{display:none}
+ #rows li.think .dt .rs{font:italic 13px/1.5 -apple-system,system-ui,sans-serif;white-space:normal;color:#8b98a5;
+   border-left:2px solid #3a4a5c;padding:1px 0 1px 9px;margin:6px 0}
+ #rows li.think .dt .tc{margin:6px 0;padding-left:11px;white-space:pre-wrap}
+ #rows li.think .dt .rs p{margin:0 0 6px} #rows li.think .dt .rs p:last-child{margin:0}
+ #rows li.think .dt>:first-child{margin-top:0}
+ #rows li.think .dt>:last-child{margin-bottom:0}
  #rows li.think.bare{display:none}
  body.tools #rows li.think .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
    font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
@@ -111,7 +117,21 @@ function md(s){                                  // just enough for the agent's 
                .replace(/[*][*]([^*]+)[*][*]/g,'<b>$1</b>')
                .replace(/^[-*] (.+)$/gm,'• $1');
 }
-const NL=String.fromCharCode(10);
+const NL=String.fromCharCode(10), LS=String.fromCharCode(8232);
+function paras(t){                              // a thought's own lines: blank runs as one gap
+  return t.split(LS).map(x=>x.trim()).join(LS).split(LS+LS)
+          .map(x=>x.split(LS).filter(Boolean).map(md).join('<br>')).filter(Boolean).map(x=>'<p>'+x+'</p>').join('');
+}
+function detail(rest){                           // one entry per line: reasoning (its breaks sent as
+  let out='', calls=[];                          // U+2028) as a quoted block, a run of calls as a list
+  const end=()=>{if(calls.length){out+='<div class=tc>'+calls.join('')+'</div>';calls=[];}};
+  rest.split(NL).forEach(e=>{
+    if(!e.trim())return;
+    if(e.startsWith('✻')){end();out+='<div class=rs>'+paras(e.slice(1))+'</div>';}
+    else calls.push('<div>'+md(e.trim())+'</div>');
+  });
+  end(); return out;
+}
 let live=false;                                  // the link is up (the header shows a turn's status then)
 function decorate(){                             // idempotent: warp repaints rows (fresh as_of each
   let bare=null;
@@ -123,7 +143,7 @@ function decorate(){                             // idempotent: warp repaints ro
     if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
       const raw=v.dataset.raw, nl=raw.indexOf(NL);              // the list folds under the status, a tap opens it
       const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();
-      const html=md(head)+(rest?'<span class=dt>'+md(rest)+'</span>':'');
+      const html=md(head)+(rest?'<div class=dt>'+detail(rest)+'</div>':'');
       if(v.innerHTML!==html)v.innerHTML=html;
       if(!rest)bare=head;                         // no calls yet: no row, its status goes in the header
       const want='think'+(rest?' more':' bare')+(rest&&li.dataset.open==='1'?' open':'');
