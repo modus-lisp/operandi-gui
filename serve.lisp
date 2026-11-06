@@ -40,10 +40,13 @@
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
  #rows li.think .dt{display:none}
- body.notools #rows li.think{display:none}
+ #rows li.think.bare{display:none}
+ body.tools #rows li.think .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
+   font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
+ body.tools #rows li.think.more::after{content:''}
  #tools{background:none;color:#9fb4c8;border:1px solid #2a3644;border-radius:16px;
    padding:5px 12px;font:12px/1 inherit;cursor:pointer;margin-left:auto;margin-right:8px}
- body:not(.notools) #tools{background:#1b2430;color:#dce4ec}
+ body.tools #tools{background:#1b2430;color:#dce4ec}
  #rows li.think.open .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
    font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
  #rows li.think.more{cursor:pointer}
@@ -74,7 +77,7 @@
 </style></head><body>
 <div id=wrap>
  <header>operandi <small id=st>· connecting…</small>
-   <button id=tools type=button title='show or hide the tool calls'>Tools</button>
+   <button id=tools type=button title='tool calls: one line each, or all of them'>Tools</button>
    <button id=sess type=button>Sessions</button></header>
  <ul id=rows></ul><ul id=menu></ul>
  <form id=f autocomplete=off>
@@ -109,7 +112,9 @@ function md(s){                                  // just enough for the agent's 
                .replace(/^[-*] (.+)$/gm,'• $1');
 }
 const NL=String.fromCharCode(10);
+let live=false;                                  // the link is up (the header shows a turn's status then)
 function decorate(){                             // idempotent: warp repaints rows (fresh as_of each
+  let bare=null;
   rowsEl.querySelectorAll('li').forEach(li=>{    // delta), so reconcile every call, don't one-shot flag
     const tag=((li.querySelector('.l')||{}).textContent||'').trim();
     const cls=tag==='you'?'you':tag==='think'?'think':tag==='err'?'err':'bot';
@@ -120,7 +125,8 @@ function decorate(){                             // idempotent: warp repaints ro
       const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();
       const html=md(head)+(rest?'<span class=dt>'+md(rest)+'</span>':'');
       if(v.innerHTML!==html)v.innerHTML=html;
-      const want='think'+(rest?' more':'')+(rest&&li.dataset.open==='1'?' open':'');
+      if(!rest)bare=head;                         // no calls yet: no row, its status goes in the header
+      const want='think'+(rest?' more':' bare')+(rest&&li.dataset.open==='1'?' open':'');
       if(li.className!==want)li.className=want;  // the open flag lives in the dataset, where a repaint keeps it
       return;
     }
@@ -128,11 +134,12 @@ function decorate(){                             // idempotent: warp repaints ro
     const html=md(v.dataset.raw);
     if(v.innerHTML!==html)v.innerHTML=html;      // guard so we don't thrash the DOM
   });
+  if(live){const st='· '+(bare||'live'); if(stEl.textContent!==st)stEl.textContent=st;}
 }
-const toolsBtn=document.getElementById('tools');   // show/hide the tool rows; the choice is kept
-function setTools(on){document.body.classList.toggle('notools',!on);try{localStorage.setItem('tools',on?'1':'0');}catch(_){}}
-setTools((()=>{try{return localStorage.getItem('tools')!=='0';}catch(_){return true;}})());
-toolsBtn.onclick=()=>setTools(document.body.classList.contains('notools'));
+const toolsBtn=document.getElementById('tools');   // tool rows one line each (a tap opens one), or all open;
+function setTools(on){document.body.classList.toggle('tools',on);try{localStorage.setItem('tools',on?'1':'0');}catch(_){}}
+setTools((()=>{try{return localStorage.getItem('tools')==='1';}catch(_){return false;}})());   // kept
+toolsBtn.onclick=()=>setTools(!document.body.classList.contains('tools'));
 rowsEl.addEventListener('click',e=>{             // delegated: warp replaces rows wholesale
   const li=e.target.closest&&e.target.closest('li.think.more'); if(!li)return;
   li.dataset.open=li.dataset.open==='1'?'':'1'; decorate();
@@ -147,8 +154,8 @@ function connectWs(){                             // fresh consumer -> hello pul
   if(ws){ws.onclose=null;try{ws.close();}catch(_){}}
   rowsEl.innerHTML='';                            // drop the previous session's rows before the snapshot
   const me=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/warp');
-  ws.onopen=()=>{stEl.textContent='· live';atBottom=true;client.hello(ROWS,0);};
-  ws.onclose=()=>{if(ws!==me)return;stEl.textContent='· reconnecting…';retry=setTimeout(reconnect,2000);};
+  ws.onopen=()=>{live=true;stEl.textContent='· live';atBottom=true;client.hello(ROWS,0);};
+  ws.onclose=()=>{if(ws!==me)return;live=false;stEl.textContent='· reconnecting…';retry=setTimeout(reconnect,2000);};
   ws.onmessage=ev=>{client.apply(ev.data);decorate();requestAnimationFrame(stick);};
 }
 async function reconnect(){                       // the server may have restarted: put our chat back first

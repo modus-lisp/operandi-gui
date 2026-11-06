@@ -70,17 +70,40 @@ fabricate a value."
 (defun current-session-id () (and *session* (gethash :id *session*)))
 
 (defun messages-from-history (hist)
-  "Rebuild the visible transcript from a resumed session's engine history: show the
-   user + assistant TEXT turns; skip system, tool results, and tool-call-only turns."
-  (loop for m in hist
-        for role = (gethash "role" m)
-        for content = (gethash "content" m)
-        when (and (member role '("user" "assistant") :test #'string=)
-                  (stringp content) (plusp (length content)))
-          collect (make-instance 'msg :id (incf *seq*)
-                                 :role (if (string= role "user") "you" "operandi")
-                                 :text content
-                                 :kind (if (string= role "user") :you :bot))))
+  "Rebuild the visible transcript from a resumed session's engine history: the user and
+   assistant text turns, and before each reply the row of what led to it -- its reasoning and its
+   tool calls, as a live turn shows them (summary first, a tap for the rest)."
+  (let ((out '()) (log '()) (calls 0))
+    (flet ((flush ()
+             (when log
+               (push (make-instance 'msg :id (incf *seq*) :role "operandi" :kind :think
+                                    :text (format nil "~a~%~{~a~%~}" (%think-summary log) (reverse log)))
+                     out)
+               (setf log '()))))
+      (dolist (m hist)
+        (let ((role (gethash "role" m)) (content (gethash "content" m))
+              (reason (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
+          (cond ((string= role "user")
+                 (flush) (setf calls 0)
+                 (when (and (stringp content) (plusp (length content)))
+                   (push (make-instance 'msg :id (incf *seq*) :role "you" :text content :kind :you) out)))
+                ((string= role "assistant")
+                 (when (and (stringp reason) (plusp (length (string-trim " " reason))))
+                   (push (%clip-reason reason) log))
+                 (map nil (lambda (tc)
+                            (let* ((fn (and (hash-table-p tc) (gethash "function" tc)))
+                                   (args (and fn (gethash "arguments" fn)))
+                                   (args (if (stringp args) (ignore-errors (json:parse args)) args)))
+                              (when fn
+                                (push (format nil "~2,' d. ~a~@[ ~a~]" (incf calls) (gethash "name" fn)
+                                              (%arg-detail args))
+                                      log))))
+                      (or (gethash "tool_calls" m) #()))
+                 (when (and (stringp content) (plusp (length content)))
+                   (flush)
+                   (push (make-instance 'msg :id (incf *seq*) :role "operandi" :text content :kind :bot) out))))))
+      (flush))
+    (nreverse out)))
 
 (defun new-session! ()
   "Start a fresh chat: a new session, an empty transcript, a greeting."
@@ -294,17 +317,40 @@ fabricate a value."
    update, so an unbounded log would put a growing payload on the data channel
    once per tool call — and forty is already more than anyone reads on a phone.")
 
+(defvar *think-reason* (make-string-output-stream)
+  "The reasoning streaming in now, not yet in the log: it goes in as one entry when a call starts
+   or the turn ends, so the detail reads in order -- what it thought, what it did, what it thought.")
+(defvar *think-reason-n* 0 "Characters of it so far.")
+(defparameter *reason-clip* 1500 "How much of one stretch of reasoning a row keeps.")
+
+(defun %clip-reason (text)
+  (let ((r (string-trim '(#\Space #\Newline #\Tab #\Return) text)))
+    (format nil "✻ ~a" (if (> (length r) *reason-clip*) (concatenate 'string (subseq r 0 *reason-clip*) "…") r))))
+
+(defun %reason-flush ()
+  "Close the reasoning streaming in now into one log entry."
+  (when (plusp *think-reason-n*)
+    (push (%clip-reason (get-output-stream-string *think-reason*)) *tool-log*)
+    (setf *think-reason-n* 0)))
+
+(defun %think-summary (log)
+  "The status a finished row keeps: its calls counted, or that it thought."
+  (let ((calls (count-if-not (lambda (e) (eql 0 (search "✻" e))) log)))
+    (if (plusp calls) (format nil "⚙ ~d tool call~:p" calls) "✻ thought")))
+
 (defun %think-repaint ()
   "Compose the row: status line first, detail below.  FIRST is deliberate — the
    collapsed row shows only its first line, so the live status has to be that
    line, and the detail is what tapping reveals."
   (let ((m *think*))
     (when m
-      (let ((text (if *tool-log*
-                      (format nil "~a~%~{~a~%~}" *think-head*
-                              (reverse (subseq *tool-log*
-                                               0 (min *tool-log-keep* (length *tool-log*)))))
-                      *think-head*)))
+      (let* ((live (and (plusp *think-reason-n*)
+                        (%clip-reason (let ((r (get-output-stream-string *think-reason*)))
+                                        (write-string r *think-reason*)   ; read without losing it
+                                        r))))
+             (log (append (reverse (subseq *tool-log* 0 (min *tool-log-keep* (length *tool-log*))))
+                          (and live (list live))))
+             (text (if log (format nil "~a~%~{~a~%~}" *think-head* log) *think-head*)))
         (bt:with-lock-held (*lock*) (setf (msg-text m) text))))))
 
 (defun %think! (fmt &rest args)
@@ -318,12 +364,22 @@ fabricate a value."
   (push (apply #'format nil fmt args) *tool-log*)
   (%think-repaint))
 
+(defun %think-close! ()
+  "Leave the live row as what its leg did: a summary over its calls and reasoning, or nothing at
+   all when it did neither (a bare \"…thinking…\" is no record of anything)."
+  (%reason-flush)
+  (when *think*
+    (if *tool-log*
+        (%think! "~a" (%think-summary *tool-log*))
+        (bt:with-lock-held (*lock*) (setf *messages* (remove *think* *messages*))))))
+
 (defun %think-open! (head)
   "Start a FRESH rollup row with HEAD as its status, leaving the previous row
    frozen where it is.  Used when a steering message arrives: the calls before it
    and the calls after it are different answers to different instructions, and
    rolling them into one line puts the work above the words that caused it."
-  (setf *tool-log* '() *think-head* head)
+  (%think-close!)
+  (setf *tool-log* '() *think-head* head *think-reason-n* 0)
   (setf *think* (add-msg "operandi" head :think)))
 
 (defun %arg-detail (args)
@@ -360,6 +416,7 @@ fabricate a value."
     (multiple-value-bind (reply hist)
         (let* ((hooks:*pre-tool-hooks*
                  (cons (lambda (name args)
+                         (%reason-flush)
                          (incf calls)
                          (let ((b (%arg-brief args)))
                            (%think! "⚙ ~a~@[ ~a~]~@[ · ~a~]" name b
@@ -399,6 +456,14 @@ fabricate a value."
                                     (prog1 *steer* (setf *steer* '())))))
                      (when pending
                        (format nil "~{~A~^~%~%~}" pending)))))
+               (eng:*on-reasoning*
+                 (lambda (chunk)
+                   (let ((before *think-reason-n*))
+                     (write-string chunk *think-reason*)
+                     (incf *think-reason-n* (length chunk))
+                     ;; redraw every ~200 characters: it moves, which says running, not wedged
+                     (when (/= (floor before 200) (floor *think-reason-n* 200))
+                       (%think-repaint)))))
                (eng:*on-token*
                  (lambda (chunk)
                    (incf toks (length chunk))
@@ -491,7 +556,8 @@ fabricate a value."
                         do (bt:condition-wait *qcv* *qlock*))
                   (and *queue* (pop *queue*)))))
       (when text
-        (setf *tool-log* '() *think-head* "…thinking…")
+        (setf *tool-log* '() *think-head* "…thinking…" *think-reason-n* 0)
+        (get-output-stream-string *think-reason*)
         (setf *think* (add-msg "operandi" "…thinking…" :think))
         (multiple-value-bind (reply kind)
             (handler-case (values (answer text) :bot)
@@ -499,10 +565,10 @@ fabricate a value."
           ;; A turn that used tools keeps its row, the status now a summary and the calls still
           ;; under it, and the reply is a row of its own; a turn that did not is just its reply,
           ;; written over the thinking row (same id -> a :changed delta).
+          (%reason-flush)
           (let ((mid (if *tool-log*
-                         (let ((n (length *tool-log*)))
-                           (%think! "⚙ ~d tool call~:p" n)
-                           (msg-id (add-msg "operandi" reply kind)))
+                         (progn (%think-close!)
+                                (msg-id (add-msg "operandi" reply kind)))
                          (progn (bt:with-lock-held (*lock*)
                                   (setf (msg-text *think*) reply
                                         (slot-value *think* 'kind) kind))
