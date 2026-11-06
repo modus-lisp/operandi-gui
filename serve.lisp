@@ -118,7 +118,7 @@ function connectWs(){                             // fresh consumer -> hello pul
   if(retry){clearTimeout(retry);retry=null;}
   if(ws){ws.onclose=null;try{ws.close();}catch(_){}}
   rowsEl.innerHTML='';                            // drop the previous session's rows before the snapshot
-  const me=ws=new WebSocket('ws://'+location.host+'/warp');
+  const me=ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/warp');
   ws.onopen=()=>{stEl.textContent='· live';atBottom=true;client.hello(ROWS,0);};
   ws.onclose=()=>{if(ws!==me)return;stEl.textContent='· reconnecting…';retry=setTimeout(reconnect,2000);};
   ws.onmessage=ev=>{client.apply(ev.data);decorate();requestAnimationFrame(stick);};
