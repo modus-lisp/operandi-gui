@@ -109,13 +109,30 @@ function decorate(){                             // idempotent: warp repaints ro
     if(v.innerHTML!==html)v.innerHTML=html;      // guard so we don't thrash the DOM
   });
 }
+let chatId=null, retry=null;                     // the chat this page shows; a pending reconnect
+function setChat(id){                             // the URL names the open chat, so a reload resumes it
+  chatId=id||null;
+  history.replaceState(null,'',chatId?'?s='+encodeURIComponent(chatId):location.pathname);
+}
 function connectWs(){                             // fresh consumer -> hello pulls the current transcript
-  if(ws){try{ws.close();}catch(_){}}
+  if(retry){clearTimeout(retry);retry=null;}
+  if(ws){ws.onclose=null;try{ws.close();}catch(_){}}
   rowsEl.innerHTML='';                            // drop the previous session's rows before the snapshot
-  ws=new WebSocket('ws://'+location.host+'/warp');
+  const me=ws=new WebSocket('ws://'+location.host+'/warp');
   ws.onopen=()=>{stEl.textContent='· live';atBottom=true;client.hello(ROWS,0);};
-  ws.onclose=()=>{stEl.textContent='· disconnected';};
+  ws.onclose=()=>{if(ws!==me)return;stEl.textContent='· reconnecting…';retry=setTimeout(reconnect,2000);};
   ws.onmessage=ev=>{client.apply(ev.data);decorate();requestAnimationFrame(stick);};
+}
+async function reconnect(){                       // the server may have restarted: put our chat back first
+  retry=null;
+  try{
+    const cur=(await (await fetch('/current')).text()).trim();
+    if(chatId&&cur!==chatId){
+      const r=await fetch('/open',{method:'POST',body:chatId});
+      if(!r.ok){setChat(null);stEl.textContent='· live';showPicker();return;}
+    }
+    connectWs();
+  }catch(_){stEl.textContent='· reconnecting…';retry=setTimeout(reconnect,3000);}
 }
 
 const f=document.getElementById('f'), say=document.getElementById('say');
@@ -147,17 +164,19 @@ async function showPicker(){
     const m=document.createElement('div');m.className='m';
     m.textContent=`${fmtWhen(s.id)} · ${s.turns} turn${s.turns===1?'':'s'}`;
     li.append(t,m);
-    li.onclick=async()=>{await fetch('/open',{method:'POST',body:s.id});enterChat();};
+    li.onclick=async()=>{await fetch('/open',{method:'POST',body:s.id});setChat(s.id);enterChat();};
     slist.append(li);
   }
 }
 function enterChat(){picker.classList.remove('show');connectWs();setTimeout(()=>say.focus(),50);}
-document.getElementById('new').onclick=async()=>{await fetch('/new',{method:'POST'});enterChat();};
+async function newChat(){setChat((await (await fetch('/new',{method:'POST'})).text()).trim());enterChat();}
+document.getElementById('new').onclick=newChat;
 document.getElementById('sess').onclick=showPicker;
 // Deep links: ?s=<id> opens a chat, ?new starts one; otherwise the picker (cold start).
 const params=new URLSearchParams(location.search);
-if(params.get('s')){fetch('/open',{method:'POST',body:params.get('s')}).then(enterChat);}
-else if(params.has('new')){fetch('/new',{method:'POST'}).then(enterChat);}
+if(params.get('s')){fetch('/open',{method:'POST',body:params.get('s')})
+  .then(r=>{if(r.ok){setChat(params.get('s'));enterChat();}else{setChat(null);showPicker();}});}
+else if(params.has('new')){newChat();}
 else showPicker();
 </script></body></html>")
 
@@ -205,12 +224,15 @@ else showPicker();
                                 (or (ignore-errors (sessions-json)) "[]")))
              ((and (string= method "POST") (eql 0 (search "/new" path)))
               (read-body stream headers)
-              (new-session!)
-              (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
+              (warp-dom::http-respond stream "200 OK" "text/plain" (or (new-session!) "")))
+             ((and (string= method "GET") (eql 0 (search "/current" path)))
+              (warp-dom::http-respond stream "200 OK" "text/plain" (or (current-session-id) "")))
              ((and (string= method "POST") (eql 0 (search "/open" path)))
               (let* ((id (string-trim '(#\Space #\Newline #\Return #\Tab)
                                       (or (read-body stream headers) "")))
-                     (ok (and (plusp (length id)) (ignore-errors (open-session! id)))))
+                     (ok (and (plusp (length id))
+                              ;; the open chat (perhaps mid-turn, not yet saved) stays as it is
+                              (or (equal id (current-session-id)) (ignore-errors (open-session! id))))))
                 (warp-dom::http-respond stream (if ok "200 OK" "404 Not Found")
                                   "text/plain" (if ok "ok" "no such session"))))
              ((string= method "GET")
