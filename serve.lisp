@@ -39,6 +39,12 @@
  #rows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
+ #rows li.think .dt{display:none}
+ #rows li.think.open .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
+   font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
+ #rows li.think.more{cursor:pointer}
+ #rows li.think.more::after{content:' ▾';color:#4d5862;font-style:normal}
+ #rows li.think.more.open::after{content:' ▴'}
  #rows li.err{margin-right:auto;background:#3a1c1c;color:#ffb0b0}
  #menu{display:none}
  form{display:flex;gap:8px;padding:10px;border-top:1px solid #1b2430;flex:0 0 auto;background:#0d1117}
@@ -97,18 +103,31 @@ function md(s){                                  // just enough for the agent's 
                .replace(/[*][*]([^*]+)[*][*]/g,'<b>$1</b>')
                .replace(/^[-*] (.+)$/gm,'• $1');
 }
+const NL=String.fromCharCode(10);
 function decorate(){                             // idempotent: warp repaints rows (fresh as_of each
   rowsEl.querySelectorAll('li').forEach(li=>{    // delta), so reconcile every call, don't one-shot flag
     const tag=((li.querySelector('.l')||{}).textContent||'').trim();
     const cls=tag==='you'?'you':tag==='think'?'think':tag==='err'?'err':'bot';
-    if(li.className!==cls)li.className=cls;
-  });
-  rowsEl.querySelectorAll('.v').forEach(v=>{
+    const v=li.querySelector('.v'); if(!v){if(li.className!==cls)li.className=cls;return;}
     if(v.dataset.raw===undefined)v.dataset.raw=v.textContent;   // capture source before we rewrite it
+    if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
+      const raw=v.dataset.raw, nl=raw.indexOf(NL);              // the list folds under the status, a tap opens it
+      const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();
+      const html=md(head)+(rest?'<span class=dt>'+md(rest)+'</span>':'');
+      if(v.innerHTML!==html)v.innerHTML=html;
+      const want='think'+(rest?' more':'')+(rest&&li.dataset.open==='1'?' open':'');
+      if(li.className!==want)li.className=want;  // the open flag lives in the dataset, where a repaint keeps it
+      return;
+    }
+    if(li.className!==cls)li.className=cls;
     const html=md(v.dataset.raw);
     if(v.innerHTML!==html)v.innerHTML=html;      // guard so we don't thrash the DOM
   });
 }
+rowsEl.addEventListener('click',e=>{             // delegated: warp replaces rows wholesale
+  const li=e.target.closest&&e.target.closest('li.think.more'); if(!li)return;
+  li.dataset.open=li.dataset.open==='1'?'':'1'; decorate();
+});
 let chatId=null, retry=null;                     // the chat this page shows; a pending reconnect
 function setChat(id){                             // the URL names the open chat, so a reload resumes it
   chatId=id||null;
