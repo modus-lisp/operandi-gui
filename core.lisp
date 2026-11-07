@@ -355,11 +355,14 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 ;;; Typed into the same box as everything else, because on a phone that box is the only input this
 ;;; app has.  A line beginning with / is the GUI's own and never reaches the agent.
 
+(defvar *backend* :openrouter
+  "Where the chat's model runs when *CHAT-URL* names no local server: :OPENROUTER or :PPQ.")
+
 (defun use-model (slug)
   "Point the engine at SLUG: on the local server when *CHAT-URL* is set (SLUG NIL asks it what it
-   serves), on PPQ when OPERANDI_CHAT_BACKEND is ppq, else on OpenRouter."
+   serves), else on *BACKEND*."
   (cond (*chat-url* (llm:set-backend-llama! :url *chat-url* :model slug))
-        ((equalp (uiop:getenv "OPERANDI_CHAT_BACKEND") "ppq") (llm:set-backend-ppq! :model slug))
+        ((eq *backend* :ppq) (llm:set-backend-ppq! :model slug))
         (t (llm:set-backend-openrouter! :model slug))))
 
 (defun set-model (slug)

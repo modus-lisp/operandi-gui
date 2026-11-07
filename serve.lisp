@@ -367,6 +367,50 @@ else showPicker();
   (force-output)
   port)
 
+(defparameter +usage+
+  "bin/operandi-gui [flags] -- the chat page, http://HOST:PORT/
+  --host H            address to listen on (default 127.0.0.1: anyone who reaches the page
+                      drives the agent's tools)
+  --port N            (default 8790)
+  --model M           the chat's model
+  --ppq               run it on PPQ (default model deepseek/deepseek-v4.1-flash), not OpenRouter
+  --url URL           run it on a local OpenAI-compatible server instead
+                      (http://127.0.0.1:8080/v1/chat/completions)
+  --images URL|ppq    where the agent's Imagine tool gets pictures: an OpenAI image server
+                      (ex-nihilo's, http://127.0.0.1:9940), or ppq's image models
+  --image-model M     the image model (on ppq default qwen-image-3)
+  --no-tool-images    don't show the model the pictures its tools make or open
+OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
+
+(defun main (args)
+  "bin/operandi-gui: ARGS as +USAGE+ describes, then serve until interrupted."
+  (let ((host *host*) (port *port*) (model-given nil))
+    (flet ((die (fmt &rest xs)
+             (format *error-output* "operandi-gui: ~?~%" fmt xs)
+             (uiop:quit 2)))
+      (loop while args
+            do (let ((a (pop args)))
+                 (flet ((val () (or (pop args) (die "~a wants a value" a))))
+                   (cond ((string= a "--host") (setf host (val)))
+                         ((string= a "--port")
+                          (setf port (or (ignore-errors (parse-integer (val))) (die "--port wants a number"))))
+                         ((string= a "--model") (setf *model* (val) model-given t))
+                         ((string= a "--ppq") (setf *backend* :ppq))
+                         ((string= a "--url") (setf *chat-url* (val)))
+                         ((string= a "--images")
+                          (multiple-value-bind (v ok) (tools:parse-images (val))
+                            (unless ok (die "--images takes an http(s) URL of an image server, or ppq"))
+                            (setf tools:*images* v)))
+                         ((string= a "--image-model") (setf tools:*image-model* (val)))
+                         ((string= a "--no-tool-images") (setf eng:*tool-images-p* nil))
+                         ((member a '("-h" "--help") :test #'string=)
+                          (write-line +usage+) (uiop:quit 0))
+                         (t (die "unknown flag ~a (--help lists them)" a))))))
+      (when (and (eq *backend* :ppq) (not model-given) (not (uiop:getenv "OPERANDI_CHAT_MODEL")))
+        (setf *model* "deepseek/deepseek-v4.1-flash"))
+      (start :host host :port port :model *model*)
+      (when tools:*images* (format t "~&  pictures from ~a~%" (tools:images-label)) (force-output)))))
+
 (defun stop ()
   (setf *running* nil)
   (bt:with-lock-held (*qlock*) (bt:condition-notify *qcv*))
