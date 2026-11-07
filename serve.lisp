@@ -38,6 +38,16 @@
  /* sender styling, applied from the (hidden) kind tag by decorate() */
  #rows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
+ #rows li.file{margin-right:auto;padding:0;background:none;white-space:normal}
+ #rows li.file .file{display:inline-block;max-width:100%;vertical-align:top}
+ #rows li.file img{display:block;max-width:100%;max-height:min(70vh,calc(100vh - 210px));min-height:0;width:auto;height:auto;border-radius:10px 10px 0 0}
+ #rows li.file .dl{display:block;padding:8px 13px;background:#1b2430;color:#dce4ec;text-decoration:none;
+   border-radius:0 0 10px 10px;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ #rows li.file .dl:only-child{border-radius:10px}
+ #rows li.file .note{padding:8px 13px 0;background:#1b2430;font-size:14px;white-space:normal}
+ #rows li.file .note:first-child{border-radius:10px 10px 0 0}
+ #rows li.file .note+.dl{color:#8a949c;font-size:13px}
+ @media (max-width:600px){#rows li.file{max-width:100%}}  /* a phone: a picture takes the column */
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
  #rows li.think .dt{display:none}
  #rows li.think .dt .rs{font:italic 13px/1.5 -apple-system,system-ui,sans-serif;white-space:normal;color:#8b98a5;
@@ -133,6 +143,16 @@ function detail(rest){                           // one entry per line: reasonin
   end(); return out;
 }
 let live=false;                                  // the link is up (the header shows a turn's status then)
+function fmtSize(n){return n<1024?n+' B':n<1048576?Math.round(n/1024)+' KB':(n/1048576).toFixed(1)+' MB';}
+function fileEl(f){                              // built, not written as HTML: a name is never markup
+  const box=document.createElement('div');box.className='file';
+  const link=()=>{const a=document.createElement('a');a.href=f.href;a.download=f.name;return a;};
+  if(f.preview&&/^data:image[/](png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(f.preview)){
+    const a=link(),im=document.createElement('img');im.src=f.preview;im.alt=f.name;a.appendChild(im);box.appendChild(a);}
+  if(f.note){const n=document.createElement('div');n.className='note';n.textContent=f.note;box.appendChild(n);}
+  const d=link();d.className='dl';d.textContent='⬇ '+f.name+' · '+fmtSize(f.size);box.appendChild(d);
+  return box;
+}
 function decorate(){                             // idempotent: warp repaints rows (fresh as_of each
   let bare=null;
   rowsEl.querySelectorAll('li').forEach(li=>{    // delta), so reconcile every call, don't one-shot flag
@@ -140,6 +160,12 @@ function decorate(){                             // idempotent: warp repaints ro
     const cls=tag==='you'?'you':tag==='think'?'think':tag==='err'?'err':'bot';
     const v=li.querySelector('.v'); if(!v){if(li.className!==cls)li.className=cls;return;}
     if(v.dataset.raw===undefined)v.dataset.raw=v.textContent;   // capture source before we rewrite it
+    if(tag==='file'){                            // a file: a download, with its picture when it is one
+      if(li.className!=='file')li.className='file';
+      if(!v.querySelector('.file')){let f=null;try{f=JSON.parse(v.dataset.raw);}catch(_){}
+        if(f){v.textContent='';v.appendChild(fileEl(f));}}
+      return;
+    }
     if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
       const raw=v.dataset.raw, nl=raw.indexOf(NL);              // the list folds under the status, a tap opens it
       const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();
@@ -258,6 +284,20 @@ else showPicker();
                do (warp-dom:channel-receive ch text))
       (warp-dom:channel-close ch))))
 
+(defun respond-file (stream path name mime)
+  "A stored file's bytes, as a download named NAME."
+  (let ((bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8)))) (read-sequence v in) v)))
+        (safe (substitute-if #\_ (lambda (c) (or (char= c #\") (char= c #\\) (char< c #\Space) (char> c #\~))) name)))
+    (write-sequence (sb-ext:string-to-octets
+                     (format nil "HTTP/1.1 200 OK~c~cContent-Type: ~a~c~cContent-Length: ~d~c~cContent-Disposition: attachment; filename=\"~a\"~c~cCache-Control: private, max-age=86400~c~cConnection: close~c~c~c~c"
+                             #\Return #\Newline mime #\Return #\Newline (length bytes) #\Return #\Newline safe
+                             #\Return #\Newline #\Return #\Newline #\Return #\Newline #\Return #\Newline)
+                     :external-format :latin-1)
+                    stream)
+    (write-sequence bytes stream)
+    (finish-output stream)))
+
 (defun serve-connection (conn)
   (let ((stream (sb-bsd-sockets:socket-make-stream conn :input t :output t
                                                         :element-type '(unsigned-byte 8))))
@@ -274,6 +314,15 @@ else showPicker();
               (let ((body (read-body stream headers)))
                 (when (and body (plusp (length body))) (ignore-errors (say body))))
               (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
+             ;; GET /file/<session>/<id>: a file the agent handed over, from that chat's store
+             ((and (string= method "GET") (eql 0 (search "/file/" path)))
+              (let* ((parts (uiop:split-string (subseq path 6) :separator "/"))
+                     (sid (first parts)) (id (second parts)))
+                (multiple-value-bind (f name size mime) (and sid id (stored-file id sid))
+                  (declare (ignore size))
+                  (if f
+                      (respond-file stream f name mime)
+                      (warp-dom::http-respond stream "404 Not Found" "text/plain" "no such file")))))
              ((and (string= method "GET") (eql 0 (search "/sessions" path)))
               (warp-dom::http-respond stream "200 OK" "application/json; charset=utf-8"
                                 (or (ignore-errors (sessions-json)) "[]")))
@@ -317,6 +366,50 @@ else showPicker();
   (format t "~&operandi chat :: http://~a:~d/  (model ~a)~%" host port *model*)
   (force-output)
   port)
+
+(defparameter +usage+
+  "bin/operandi-gui [flags] -- the chat page, http://HOST:PORT/
+  --host H            address to listen on (default 127.0.0.1: anyone who reaches the page
+                      drives the agent's tools)
+  --port N            (default 8790)
+  --model M           the chat's model
+  --ppq               run it on PPQ (default model deepseek/deepseek-v4.1-flash), not OpenRouter
+  --url URL           run it on a local OpenAI-compatible server instead
+                      (http://127.0.0.1:8080/v1/chat/completions)
+  --images URL|ppq    where the agent's Imagine tool gets pictures: an OpenAI image server
+                      (ex-nihilo's, http://127.0.0.1:9940), or ppq's image models
+  --image-model M     the image model (on ppq default qwen-image-3)
+  --no-tool-images    don't show the model the pictures its tools make or open
+OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
+
+(defun main (args)
+  "bin/operandi-gui: ARGS as +USAGE+ describes, then serve until interrupted."
+  (let ((host *host*) (port *port*) (model-given nil))
+    (flet ((die (fmt &rest xs)
+             (format *error-output* "operandi-gui: ~?~%" fmt xs)
+             (uiop:quit 2)))
+      (loop while args
+            do (let ((a (pop args)))
+                 (flet ((val () (or (pop args) (die "~a wants a value" a))))
+                   (cond ((string= a "--host") (setf host (val)))
+                         ((string= a "--port")
+                          (setf port (or (ignore-errors (parse-integer (val))) (die "--port wants a number"))))
+                         ((string= a "--model") (setf *model* (val) model-given t))
+                         ((string= a "--ppq") (setf *backend* :ppq))
+                         ((string= a "--url") (setf *chat-url* (val)))
+                         ((string= a "--images")
+                          (multiple-value-bind (v ok) (tools:parse-images (val))
+                            (unless ok (die "--images takes an http(s) URL of an image server, or ppq"))
+                            (setf tools:*images* v)))
+                         ((string= a "--image-model") (setf tools:*image-model* (val)))
+                         ((string= a "--no-tool-images") (setf eng:*tool-images-p* nil))
+                         ((member a '("-h" "--help") :test #'string=)
+                          (write-line +usage+) (uiop:quit 0))
+                         (t (die "unknown flag ~a (--help lists them)" a))))))
+      (when (and (eq *backend* :ppq) (not model-given) (not (uiop:getenv "OPERANDI_CHAT_MODEL")))
+        (setf *model* "deepseek/deepseek-v4.1-flash"))
+      (start :host host :port port :model *model*)
+      (when tools:*images* (format t "~&  pictures from ~a~%" (tools:images-label)) (force-output)))))
 
 (defun stop ()
   (setf *running* nil)

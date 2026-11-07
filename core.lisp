@@ -19,7 +19,7 @@
   (:export #:*model* #:*system-prompt* #:*tool-names*
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
            #:*proj* #:chat-projection
-           #:say #:new-session! #:open-session! #:sessions-json #:current-session-id
+           #:say #:stored-file #:file-payload #:new-session! #:open-session! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
            #:set-model #:handle-command #:effort-label #:context-budget-k #:compact-at-k))
@@ -51,11 +51,174 @@ fabricate a value."
   ((id   :initarg :id   :reader msg-id)
    (role :initarg :role :reader msg-role)       ; "you" | "operandi" | "…"
    (text :initarg :text :accessor msg-text)
-   (kind :initarg :kind :reader msg-kind)))     ; :you | :bot | :think | :err
+   (kind :initarg :kind :reader msg-kind)))     ; :you | :bot | :think | :err | :file (text: JSON, FILE-ROW-TEXT)
 (defvar *messages* '() "conversation, oldest first — the transcript warp renders.")
 (defvar *lock* (bt:make-lock "operandi-gui"))
 (defvar *seq* 0)
 (defvar *session* nil "the live operandi session (its :history threads across turns), or NIL when cold.")
+
+;;; ------------------------------- files --------------------------------
+;;; A file the agent hands over -- a picture Imagine made or Read opened, anything SendFile sends --
+;;; is COPIED into this chat's own store, ~/.operandi/chat-files/<session>/<id>/<name>, and its row
+;;; refers to the copy: a transcript must not break when the original moves.  The id is the start
+;;; of the content's MD5, so the same bytes sent twice are one file.  A row's text is JSON
+;;; {id,name,size,mime,href,preview}: HREF downloads it from the HTTP host; the phone, which has
+;;; no HTTP, asks the gateway for the bytes (FILE-PAYLOAD); PREVIEW, for a picture, is a data: URL
+;;; shrunk to *PICTURE-SIDE*, so the row shows it at a glance.
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-md5))
+
+(defparameter *files-root* (merge-pathnames ".operandi/chat-files/" (user-homedir-pathname)))
+(defparameter *picture-side* 768 "Longest side, in pixels, of a picture's preview.")
+(defparameter *phone-file-max* (* 25 1024 1024)
+  "The largest file the phone fetches in one frame; larger ones are for the HTTP page.")
+
+(defparameter +mime-types+
+  '(("txt" . "text/plain") ("md" . "text/markdown") ("csv" . "text/csv") ("json" . "application/json")
+    ("html" . "text/html") ("pdf" . "application/pdf") ("zip" . "application/zip")
+    ("svg" . "image/svg+xml") ("mp3" . "audio/mpeg") ("wav" . "audio/wav") ("mp4" . "video/mp4")))
+
+(defun file-mime (name)
+  (or (llm:image-file-p name)
+      (cdr (assoc (pathname-type (pathname name)) +mime-types+ :test #'equalp))
+      "application/octet-stream"))
+
+(defun read-octets (path)
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8)))) (read-sequence v in) v)))
+
+(defun files-dir (sid) (merge-pathnames (format nil "~a/" sid) *files-root*))
+
+(defun file-id-p (id)
+  (and (stringp id) (= (length id) 12) (every (lambda (c) (digit-char-p c 16)) id)))
+
+(defun stored-file (id &optional (sid (current-session-id)))
+  "(values path name size mime) of stored file ID in chat SID, or NIL."
+  (when (and sid (file-id-p id) (every (lambda (c) (or (alphanumericp c) (char= c #\-))) sid))
+    (let ((f (first (uiop:directory-files (merge-pathnames (format nil "~a/" id) (files-dir sid))))))
+      (when f
+        (let ((name (file-namestring f)))
+          (values f name (with-open-file (in f :element-type '(unsigned-byte 8)) (file-length in))
+                  (file-mime name)))))))
+
+(defun index-file (sid) (merge-pathnames "index.sexp" (files-dir sid)))
+
+(defun stored-id-of (path sid)
+  "The id PATH was stored under in chat SID, if it was (the original may since have moved)."
+  (let ((f (index-file sid)))
+    (when (probe-file f)
+      (cdr (assoc path (ignore-errors (with-open-file (in f) (let ((*read-eval* nil)) (read in nil))))
+                  :test #'equal)))))
+
+(defun store-file (path &optional (sid (current-session-id)))
+  "Copy PATH into chat SID's store; its id."
+  (let* ((bytes (read-octets path))
+         (id (string-downcase (subseq (format nil "~{~2,'0x~}" (coerce (sb-md5:md5sum-sequence bytes) 'list)) 0 12)))
+         (dest (merge-pathnames (format nil "~a/~a" id (file-namestring path)) (files-dir sid))))
+    (unless (stored-file id sid)
+      (ensure-directories-exist dest)
+      (with-open-file (o dest :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+        (write-sequence bytes o)))
+    (let* ((f (index-file sid))
+           (index (and (probe-file f) (ignore-errors (with-open-file (in f) (let ((*read-eval* nil)) (read in nil)))))))
+      (unless (equal (cdr (assoc path index :test #'equal)) id)
+        (ensure-directories-exist f)
+        (with-open-file (o f :direction :output :if-exists :supersede)
+          (with-standard-io-syntax (prin1 (acons path id (remove path index :key #'car :test #'equal)) o)))))
+    id))
+
+(defun file-row-text (id sid &optional note)
+  (multiple-value-bind (path name size mime) (stored-file id sid)
+    (when path
+      (let ((h (llm:ht "id" id "name" name "size" size "mime" mime
+                       "href" (format nil "/file/~a/~a" sid id))))
+        (when (and (stringp note) (plusp (length note))) (setf (gethash "note" h) note))
+        (when (llm:image-file-p name)
+          (let ((url (ignore-errors (gethash "url" (gethash "image_url" (llm:image-part path :max-side *picture-side*))))))
+            (when url (setf (gethash "preview" h) url))))
+        (json:stringify h)))))
+
+(defun file-msg (id &optional (sid (current-session-id)) note)
+  "A row for stored file ID, captioned NOTE (an error row when it is gone)."
+  (let ((text (and id (file-row-text id sid note))))
+    (make-instance 'msg :id (incf *seq*) :role "operandi"
+                        :text (or text "(a file that is no longer stored)") :kind (if text :file :err))))
+
+(defun path-file-msg (path &optional (sid (current-session-id)))
+  "A row for the file at PATH: its stored copy, storing it now if it never was."
+  (let ((id (or (stored-id-of path sid)
+                (and sid (probe-file path) (ignore-errors (store-file path sid))))))
+    (if id
+        (file-msg id sid)
+        (make-instance 'msg :id (incf *seq*) :role "operandi"
+                            :text (format nil "(file no longer available: ~a)" path) :kind :err))))
+
+(defun file-payload (id)
+  "The phone's download: {a:chat, file:{id,name,mime,b64}} for stored file ID, or an error."
+  (multiple-value-bind (path name size mime) (stored-file id)
+    (json:stringify
+     (llm:ht "a" "chat"
+             "file" (cond ((null path) (llm:ht "id" id "error" "no such file"))
+                          ((> size *phone-file-max*)
+                           (llm:ht "id" id "error" (format nil "~a is ~:d bytes: download it from the desktop page" name size)))
+                          (t (llm:ht "id" id "name" name "mime" mime
+                                     "b64" (cl-base64:usb8-array-to-base64-string (read-octets path)))))))))
+
+(defun tool-picture-paths (content)
+  "The paths in an engine tool-pictures message (operandi.engine's TOOL-IMAGES-MSG), or NIL when
+   CONTENT is not one: its first text part is the tag, then one \"<path>:\" part per picture."
+  (when (and (vectorp content) (plusp (length content)) (hash-table-p (aref content 0))
+             (eql 0 (search "[Pictures from the tool calls above" (or (gethash "text" (aref content 0)) ""))))
+    (loop for part across content
+          for text = (and (hash-table-p part) (equal (gethash "type" part) "text") (gethash "text" part))
+          for line = (and text (string-trim '(#\Newline #\Space) text))
+          when (and line (> (length line) 1) (char= (char line (1- (length line))) #\:)
+                    (char= (char line 0) #\/))
+            collect (subseq line 0 (1- (length line))))))
+
+(defun sent-file-id (content)
+  "(values id note) from a SendFile result (\"Sent NAME to the user [file ID]: NOTE\"), or NIL."
+  (let ((i (and (stringp content) (search "[file " content))))
+    (when i
+      (let ((id (subseq content (+ i 6) (min (length content) (+ i 18)))))
+        (when (file-id-p id)
+          (values id (let ((j (search "]: " content :start2 i))) (and j (subseq content (+ j 3))))))))))
+
+(defun file-row-id (m)
+  "The id of the file row M, or NIL."
+  (and (eq (msg-kind m) :file)
+       (ignore-errors (gethash "id" (json:parse (msg-text m))))))
+
+(defun add-row (row)
+  (bt:with-lock-held (*lock*) (setf *messages* (append *messages* (list row)))))
+
+(defun add-file-row (id sid &optional note)
+  "A row for stored file ID -- unless the chat already shows it, as when SendFile hands over the
+   picture Imagine just made; a NOTE then captions the row already there."
+  (let ((there (bt:with-lock-held (*lock*) (find id *messages* :key #'file-row-id :test #'equal))))
+    (cond ((null there) (add-row (file-msg id sid note)))
+          ((and (stringp note) (plusp (length note)))
+           (let ((text (file-row-text id sid note)))
+             (when text (bt:with-lock-held (*lock*) (setf (msg-text there) text))))))))
+
+(tools:register-tool
+ "SendFile"
+ "Hand the user a file: it appears in the chat as a download (a picture with its preview), and stays
+there even if the original later moves.  Use it for anything you made for them to keep -- a report,
+a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
+ (llm:ht "type" "object"
+         "properties" (llm:ht "path" (llm:ht "type" "string" "description" "The file to send.")
+                              "note" (llm:ht "type" "string" "description" "A line shown with it."))
+         "required" (vector "path"))
+ (lambda (args)
+   (let ((path (gethash "path" args)) (sid (current-session-id)))
+     (cond ((not sid) "SendFile: no chat is open")
+           ((not (and (stringp path) (probe-file path) (uiop:file-exists-p path)))
+            (format nil "SendFile: no such file: ~a" path))
+           (t (let ((id (store-file (namestring (truename path)) sid))
+                    (note (let ((n (gethash "note" args)))
+                            (and (stringp n) (plusp (length n)) (substitute #\Space #\Newline n)))))
+                (add-file-row id sid note)
+                (format nil "Sent ~a to the user [file ~a]~@[: ~a~]" (file-namestring path) id note)))))))
 
 (defun add-msg (role text kind)
   (bt:with-lock-held (*lock*)
@@ -73,17 +236,35 @@ fabricate a value."
   "Rebuild the visible transcript from a resumed session's engine history: the user and
    assistant text turns, and before each reply the row of what led to it -- its reasoning and its
    tool calls, as a live turn shows them (summary first, a tap for the rest)."
-  (let ((out '()) (log '()) (calls 0))
+  (let ((out '()) (log '()) (calls 0) (pics '()) (sid (current-session-id))
+        (seen (make-hash-table :test 'equal)))   ; file id -> its row: one row a file
     (flet ((flush ()
              (when log
                (push (make-instance 'msg :id (incf *seq*) :role "operandi" :kind :think
                                     :text (format nil "~a~%~{~a~%~}" (%think-summary log) (reverse log)))
                      out)
-               (setf log '()))))
+               (setf log '()))
+             ;; the pictures the calls made, after their row, as a live turn adds them
+             (dolist (p (reverse pics))
+               (destructuring-bind (kind x &optional note) p
+                 (let ((id (if (eq kind :id) x (or (stored-id-of x sid) (and sid (probe-file x) (ignore-errors (store-file x sid)))))))
+                   (cond ((null id) (push (path-file-msg x sid) out))
+                         ((gethash id seen) (when note (let ((m (gethash id seen)) (text (file-row-text id sid note)))
+                                                         (when text (setf (msg-text m) text)))))
+                         (t (let ((m (file-msg id sid note))) (setf (gethash id seen) m) (push m out)))))))
+             (setf pics '())))
       (dolist (m hist)
         (let ((role (gethash "role" m)) (content (gethash "content" m))
               (reason (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
-          (cond ((string= role "user")
+          (cond ((and (string= role "user") (tool-picture-paths content))
+                 ;; after the row holding the calls that made them; with no such row pending (the
+                 ;; reply that made the calls already closed it), right here
+                 (dolist (p (tool-picture-paths content)) (pushnew (list :path p) pics :test #'equal))
+                 (unless log (flush)))
+                ((and (string= role "tool") (sent-file-id content))
+                 (multiple-value-bind (id note) (sent-file-id content)
+                   (push (list :id id note) pics)))
+                ((string= role "user")
                  (flush) (setf calls 0)
                  (when (and (stringp content) (plusp (length content)))
                    (push (make-instance 'msg :id (incf *seq*) :role "you" :text content :kind :you) out)))
@@ -174,12 +355,15 @@ fabricate a value."
 ;;; Typed into the same box as everything else, because on a phone that box is the only input this
 ;;; app has.  A line beginning with / is the GUI's own and never reaches the agent.
 
+(defvar *backend* :openrouter
+  "Where the chat's model runs when *CHAT-URL* names no local server: :OPENROUTER or :PPQ.")
+
 (defun use-model (slug)
   "Point the engine at SLUG: on the local server when *CHAT-URL* is set (SLUG NIL asks it what it
-   serves), else on OpenRouter."
-  (if *chat-url*
-      (llm:set-backend-llama! :url *chat-url* :model slug)
-      (llm:set-backend-openrouter! :model slug)))
+   serves), else on *BACKEND*."
+  (cond (*chat-url* (llm:set-backend-llama! :url *chat-url* :model slug))
+        ((eq *backend* :ppq) (llm:set-backend-ppq! :model slug))
+        (t (llm:set-backend-openrouter! :model slug))))
 
 (defun set-model (slug)
   "Switch the agent to SLUG — but PROVE it first.  ENG:PREFLIGHT-MODEL sends a one-token ping and
@@ -416,7 +600,8 @@ fabricate a value."
   "Run one engine turn threaded onto the live session's history, and persist it."
   (let ((base (and *session* (session:session-history *session*)))
         (calls 0)
-        (toks 0))
+        (toks 0)
+        (shown '()))                     ; pictures already given a row this turn
     (multiple-value-bind (reply hist)
         (let* ((hooks:*pre-tool-hooks*
                  (cons (lambda (name args)
@@ -439,7 +624,14 @@ fabricate a value."
                                             (format nil "— ~:d chars~@[, ~a ms~]"
                                                     (length result) ms))
                                            (t (format nil "— done~@[ in ~a ms~]" ms))))
-                         (when error (%think! "⚠ ~a failed — recovering…" name)))
+                         (when error (%think! "⚠ ~a failed — recovering…" name))
+                         ;; a picture it made or opened: a row now, not when the turn ends
+                         (when (consp tools:*tool-images*)
+                           (dolist (p (reverse tools:*tool-images*))
+                             (unless (member p shown :test #'string=)
+                               (push p shown)
+                               (let ((id (ignore-errors (store-file p))))
+                                 (if id (add-file-row id (current-session-id)) (add-row (path-file-msg p))))))))
                        hooks:*post-tool-hooks*))
                ;; Compaction is the longest silent pause in a run: it summarises the
                ;; whole span with a second model call.  Name it, or it reads as a hang.
@@ -482,7 +674,7 @@ fabricate a value."
                  :history (when base
                             (append base (list (llm:ht "role" "user" "content" text))))
                  :system *system-prompt*
-                 :tool-names (or *tool-names* (tools:default-tools))
+                 :tool-names (append (or *tool-names* (tools:default-tools)) (list "SendFile"))
                  :verbose nil))
       (when *session*
         (setf (gethash :history *session*) hist)

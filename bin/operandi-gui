@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# bin/operandi-gui — the chat page (bin/standalone.lisp).  bin/operandi-gui --help lists the flags.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)"
+exec "${OPERANDI_SBCL:-sbcl}" --dynamic-space-size "${OPERANDI_HEAP_MB:-4000}" --noinform --non-interactive \
+  --load "$ROOT/bin/standalone.lisp" --end-toplevel-options "$@"
