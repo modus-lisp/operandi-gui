@@ -38,6 +38,8 @@
  /* sender styling, applied from the (hidden) kind tag by decorate() */
  #rows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
+ #rows li.pic{margin-right:auto;padding:0;background:none;white-space:normal}
+ #rows li.pic img{display:block;max-width:100%;height:auto;border-radius:10px}
  #rows li.think{margin-right:auto;background:#161d27;color:#7d8b98;font-style:italic}
  #rows li.think .dt{display:none}
  #rows li.think .dt .rs{font:italic 13px/1.5 -apple-system,system-ui,sans-serif;white-space:normal;color:#8b98a5;
@@ -140,6 +142,12 @@ function decorate(){                             // idempotent: warp repaints ro
     const cls=tag==='you'?'you':tag==='think'?'think':tag==='err'?'err':'bot';
     const v=li.querySelector('.v'); if(!v){if(li.className!==cls)li.className=cls;return;}
     if(v.dataset.raw===undefined)v.dataset.raw=v.textContent;   // capture source before we rewrite it
+    if(tag==='pic'){                             // a picture: its data: URL, checked before it becomes src
+      if(li.className!=='pic')li.className='pic';
+      const raw=v.dataset.raw, ok=/^data:image[/](png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(raw);
+      if(!v.querySelector('img')&&ok){v.textContent='';const im=document.createElement('img');im.src=raw;im.alt='picture';v.appendChild(im);}
+      return;
+    }
     if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
       const raw=v.dataset.raw, nl=raw.indexOf(NL);              // the list folds under the status, a tap opens it
       const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();

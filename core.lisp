@@ -51,11 +51,41 @@ fabricate a value."
   ((id   :initarg :id   :reader msg-id)
    (role :initarg :role :reader msg-role)       ; "you" | "operandi" | "…"
    (text :initarg :text :accessor msg-text)
-   (kind :initarg :kind :reader msg-kind)))     ; :you | :bot | :think | :err
+   (kind :initarg :kind :reader msg-kind)))     ; :you | :bot | :think | :err | :pic (text: a data: URL)
 (defvar *messages* '() "conversation, oldest first — the transcript warp renders.")
 (defvar *lock* (bt:make-lock "operandi-gui"))
 (defvar *seq* 0)
 (defvar *session* nil "the live operandi session (its :history threads across turns), or NIL when cold.")
+
+;;; Pictures a tool made or opened (Imagine, Read of an image) are rows of their own, the picture
+;;; carried as a data: URL -- the phone surface has no HTTP to fetch a path from -- shrunk to a
+;;; size a chat column shows, so a row stays around a megabyte.
+(defparameter *picture-side* 768 "Longest side, in pixels, of a picture row.")
+
+(defun picture-url (path)
+  "PATH's picture as a data: URL no larger than *PICTURE-SIDE*, or NIL when it will not read."
+  (ignore-errors
+   (let ((part (llm:image-part path :max-side *picture-side*)))
+     (gethash "url" (gethash "image_url" part)))))
+
+(defun tool-picture-paths (content)
+  "The paths in an engine tool-pictures message (operandi.engine's TOOL-IMAGES-MSG), or NIL when
+   CONTENT is not one: its first text part is the tag, then one \"<path>:\" part per picture."
+  (when (and (vectorp content) (plusp (length content)) (hash-table-p (aref content 0))
+             (eql 0 (search "[Pictures from the tool calls above" (or (gethash "text" (aref content 0)) ""))))
+    (loop for part across content
+          for text = (and (hash-table-p part) (equal (gethash "type" part) "text") (gethash "text" part))
+          for line = (and text (string-trim '(#\Newline #\Space) text))
+          when (and line (> (length line) 1) (char= (char line (1- (length line))) #\:)
+                    (char= (char line 0) #\/))
+            collect (subseq line 0 (1- (length line))))))
+
+(defun picture-msg (path)
+  "A row for the picture at PATH (an error row when it is gone)."
+  (let ((url (picture-url path)))
+    (make-instance 'msg :id (incf *seq*) :role "operandi"
+                        :text (or url (format nil "(picture no longer available: ~a)" path))
+                        :kind (if url :pic :err))))
 
 (defun add-msg (role text kind)
   (bt:with-lock-held (*lock*)
@@ -73,17 +103,25 @@ fabricate a value."
   "Rebuild the visible transcript from a resumed session's engine history: the user and
    assistant text turns, and before each reply the row of what led to it -- its reasoning and its
    tool calls, as a live turn shows them (summary first, a tap for the rest)."
-  (let ((out '()) (log '()) (calls 0))
+  (let ((out '()) (log '()) (calls 0) (pics '()))
     (flet ((flush ()
              (when log
                (push (make-instance 'msg :id (incf *seq*) :role "operandi" :kind :think
                                     :text (format nil "~a~%~{~a~%~}" (%think-summary log) (reverse log)))
                      out)
-               (setf log '()))))
+               (setf log '()))
+             ;; the pictures the calls made, after their row, as a live turn adds them
+             (dolist (p (reverse pics)) (push (picture-msg p) out))
+             (setf pics '())))
       (dolist (m hist)
         (let ((role (gethash "role" m)) (content (gethash "content" m))
               (reason (or (gethash "reasoning_content" m) (gethash "reasoning" m))))
-          (cond ((string= role "user")
+          (cond ((and (string= role "user") (tool-picture-paths content))
+                 ;; after the row holding the calls that made them; with no such row pending (the
+                 ;; reply that made the calls already closed it), right here
+                 (dolist (p (tool-picture-paths content)) (pushnew p pics :test #'string=))
+                 (unless log (flush)))
+                ((string= role "user")
                  (flush) (setf calls 0)
                  (when (and (stringp content) (plusp (length content)))
                    (push (make-instance 'msg :id (incf *seq*) :role "you" :text content :kind :you) out)))
@@ -176,10 +214,10 @@ fabricate a value."
 
 (defun use-model (slug)
   "Point the engine at SLUG: on the local server when *CHAT-URL* is set (SLUG NIL asks it what it
-   serves), else on OpenRouter."
-  (if *chat-url*
-      (llm:set-backend-llama! :url *chat-url* :model slug)
-      (llm:set-backend-openrouter! :model slug)))
+   serves), on PPQ when OPERANDI_CHAT_BACKEND is ppq, else on OpenRouter."
+  (cond (*chat-url* (llm:set-backend-llama! :url *chat-url* :model slug))
+        ((equalp (uiop:getenv "OPERANDI_CHAT_BACKEND") "ppq") (llm:set-backend-ppq! :model slug))
+        (t (llm:set-backend-openrouter! :model slug))))
 
 (defun set-model (slug)
   "Switch the agent to SLUG — but PROVE it first.  ENG:PREFLIGHT-MODEL sends a one-token ping and
@@ -416,7 +454,8 @@ fabricate a value."
   "Run one engine turn threaded onto the live session's history, and persist it."
   (let ((base (and *session* (session:session-history *session*)))
         (calls 0)
-        (toks 0))
+        (toks 0)
+        (shown '()))                     ; pictures already given a row this turn
     (multiple-value-bind (reply hist)
         (let* ((hooks:*pre-tool-hooks*
                  (cons (lambda (name args)
@@ -439,7 +478,15 @@ fabricate a value."
                                             (format nil "— ~:d chars~@[, ~a ms~]"
                                                     (length result) ms))
                                            (t (format nil "— done~@[ in ~a ms~]" ms))))
-                         (when error (%think! "⚠ ~a failed — recovering…" name)))
+                         (when error (%think! "⚠ ~a failed — recovering…" name))
+                         ;; a picture it made or opened: a row now, not when the turn ends
+                         (when (consp tools:*tool-images*)
+                           (dolist (p (reverse tools:*tool-images*))
+                             (unless (member p shown :test #'string=)
+                               (push p shown)
+                               (let ((row (picture-msg p)))
+                                 (bt:with-lock-held (*lock*)
+                                   (setf *messages* (append *messages* (list row)))))))))
                        hooks:*post-tool-hooks*))
                ;; Compaction is the longest silent pause in a run: it summarises the
                ;; whole span with a second model call.  Name it, or it reads as a hang.
