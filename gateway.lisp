@@ -163,12 +163,14 @@ T if it handled the frame.  Cheap-gated on a substring so ordinary warp frames n
   (when (and (search "\"chat\"" text)
              (or (search "\"say\"" text) (search "\"speak\"" text) (search "\"hush\"" text)
                  (search "\"listen\"" text) (search "\"clear\"" text)
-                 (search "\"status\"" text) (search "\"cmd\"" text)))
+                 (search "\"status\"" text) (search "\"cmd\"" text) (search "\"file\"" text)))
     (handler-case
         (let ((o (json:parse text)))
           (when (and (hash-table-p o) (equal (gethash "a" o) "chat"))
             (cond
               ((stringp (gethash "say" o)) (gui:say (gethash "say" o)) t)
+              ;; a tap on a file row: its bytes, in one frame (the phone has no HTTP to the box)
+              ((stringp (gethash "file" o)) (notify (gui:file-payload (gethash "file" o))) t)
               ((nth-value 1 (gethash "listen" o))
                (if (gethash "listen" o) (listen-start) (listen-stop)) t)
               ((nth-value 1 (gethash "speak" o))
