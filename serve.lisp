@@ -90,6 +90,10 @@
  #slist .t{color:#e6edf3;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
  #slist .m{color:#5a6b7a;font-size:12px;margin-top:3px}
  #slist .empty{color:#5a6b7a;text-align:center;padding:24px;background:none;border:0}
+ #slist li{position:relative;padding-right:52px}
+ #slist .del{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:36px;height:36px;
+   border:0;border-radius:10px;background:none;color:#5a6b7a;font:400 20px/1 inherit;cursor:pointer}
+ #slist .del:hover{background:#2a1a1d;color:#f85149}
 </style></head><body>
 <div id=wrap>
  <header>operandi <small id=st>· connecting…</small>
@@ -244,7 +248,18 @@ async function showPicker(){
     const t=document.createElement('div');t.className='t';t.textContent=s.title||'(empty chat)';
     const m=document.createElement('div');m.className='m';
     m.textContent=`${fmtWhen(s.id)} · ${s.turns} turn${s.turns===1?'':'s'}`;
-    li.append(t,m);
+    const del=document.createElement('button');del.type='button';del.className='del';
+    del.textContent='×';del.title='Delete this chat';del.setAttribute('aria-label','Delete this chat');
+    del.onclick=async(e)=>{
+      e.stopPropagation();
+      if(!confirm(`Delete “${s.title||'(empty chat)'}”? It goes to ~/.operandi/chat-trash.`)) return;
+      const r=await fetch('/delete',{method:'POST',body:s.id});
+      if(!r.ok){alert(await r.text());return;}
+      if(chatId===s.id) setChat(null);
+      li.remove();
+      if(!slist.children.length) slist.innerHTML='<li class=empty>No saved chats yet.</li>';
+    };
+    li.append(t,m,del);
     li.onclick=async()=>{await fetch('/open',{method:'POST',body:s.id});setChat(s.id);enterChat();};
     slist.append(li);
   }
@@ -329,6 +344,17 @@ else showPicker();
              ((and (string= method "POST") (eql 0 (search "/new" path)))
               (read-body stream headers)
               (warp-dom::http-respond stream "200 OK" "text/plain" (or (new-session!) "")))
+             ;; POST /delete <id>: the chat moved to ~/.operandi/chat-trash/<id>/
+             ((and (string= method "POST") (eql 0 (search "/delete" path)))
+              (let* ((id (string-trim '(#\Space #\Newline #\Return #\Tab)
+                                      (or (read-body stream headers) "")))
+                     (r (handler-case (delete-session! id) (error (e) (princ-to-string e)))))
+                (case r
+                  (:deleted (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
+                  (:missing (warp-dom::http-respond stream "404 Not Found" "text/plain" "no such chat"))
+                  (:busy (warp-dom::http-respond stream "409 Conflict" "text/plain"
+                                                 "that chat is mid-turn; delete it when it has answered"))
+                  (t (warp-dom::http-respond stream "500 Internal Server Error" "text/plain" r)))))
              ((and (string= method "GET") (eql 0 (search "/current" path)))
               (warp-dom::http-respond stream "200 OK" "text/plain" (or (current-session-id) "")))
              ((and (string= method "POST") (eql 0 (search "/open" path)))

@@ -19,7 +19,7 @@
   (:export #:*model* #:*system-prompt* #:*tool-names*
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
            #:*proj* #:chat-projection
-           #:say #:stored-file #:file-payload #:new-session! #:open-session! #:sessions-json #:current-session-id
+           #:say #:stored-file #:file-payload #:new-session! #:open-session! #:delete-session! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
            #:set-model #:handle-command #:effort-label #:context-budget-k #:compact-at-k))
@@ -305,6 +305,42 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                              (list (make-instance 'msg :id (incf *seq*) :role "operandi"
                                                   :text *greeting* :kind :bot)))))
       id)))
+
+(defparameter *trash-root*
+  (merge-pathnames ".operandi/chat-trash/" (user-homedir-pathname))
+  "Where a deleted chat goes, whole (its session, its transcript, its files),
+   in a directory of its id: deleting is moving, undone by moving back.")
+
+(defun session-id-p (id)
+  "Whether ID looks like a session's id (YYYYMMDD-HHMMSS...): nothing that
+   reaches outside the sessions directory."
+  (and (stringp id) (<= 15 (length id) 40)
+       (every (lambda (c) (or (digit-char-p c) (char= c #\-))) id)))
+
+(defun delete-session! (id)
+  "Move chat ID (its .json, its .md and its files) to *TRASH-ROOT*/ID/.
+   Returns :DELETED, :MISSING, or :BUSY (the open chat, mid-turn: its turn
+   would write it back).  Deleting the open chat closes it."
+  (unless (session-id-p id) (return-from delete-session! :missing))
+  (let* ((dir session:*sessions-dir*)
+         (json (merge-pathnames (format nil "~A.json" id) dir))
+         (md (merge-pathnames (format nil "~A.md" id) dir))
+         (files (merge-pathnames (format nil "~A/" id) *files-root*))
+         (to (merge-pathnames (format nil "~A/" id) *trash-root*)))
+    (unless (or (probe-file json) (probe-file md)) (return-from delete-session! :missing))
+    (bt:with-lock-held (*lock*)
+      (when (equal id (current-session-id))
+        (when (or *think* *queue*) (return-from delete-session! :busy))
+        (setf *session* nil *messages* '())))
+    (ensure-directories-exist to)
+    (flet ((move (from to)            ; rename(2): the same filesystem, files or directories
+             (multiple-value-bind (ok err) (sb-unix:unix-rename from to)
+               (unless ok (error "cannot move ~A to ~A: ~A" from to (sb-int:strerror err))))))
+      (dolist (f (list json md))
+        (when (probe-file f) (move (namestring f) (namestring (merge-pathnames (file-namestring f) to)))))
+      (when (uiop:directory-exists-p files)
+        (move (string-right-trim "/" (namestring files)) (namestring (merge-pathnames "files" to)))))
+    :deleted))
 
 (defun sessions-json ()
   "The saved chats as JSON for the picker: newest first, each {id,title,turns}."
