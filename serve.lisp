@@ -406,11 +406,13 @@ else showPicker();
                       (ex-nihilo's, http://127.0.0.1:9940), or ppq's image models
   --image-model M     the image model (on ppq default qwen-image-3)
   --no-tool-images    don't show the model the pictures its tools make or open
+  --effort E          reasoning: off, low, medium or high (with --url default high: a local
+                      server otherwise gets thinking turned off)
 OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
 
 (defun main (args)
   "bin/operandi-gui: ARGS as +USAGE+ describes, then serve until interrupted."
-  (let ((host *host*) (port *port*) (model-given nil))
+  (let ((host *host*) (port *port*) (model-given nil) (effort nil))
     (flet ((die (fmt &rest xs)
              (format *error-output* "operandi-gui: ~?~%" fmt xs)
              (uiop:quit 2)))
@@ -429,12 +431,18 @@ OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
                             (setf tools:*images* v)))
                          ((string= a "--image-model") (setf tools:*image-model* (val)))
                          ((string= a "--no-tool-images") (setf eng:*tool-images-p* nil))
+                         ((string= a "--effort")
+                          (setf effort (or (llm:parse-effort (val)) (die "--effort is off, low, medium or high"))))
                          ((member a '("-h" "--help") :test #'string=)
                           (write-line +usage+) (uiop:quit 0))
                          (t (die "unknown flag ~a (--help lists them)" a))))))
       (when (and (eq *backend* :ppq) (not model-given) (not (uiop:getenv "OPERANDI_CHAT_MODEL")))
         (setf *model* "deepseek/deepseek-v4.1-flash"))
       (start :host host :port port :model *model*)
+      ;; reasoning: as asked; on a local server, high unless asked (operandi's default there is off,
+      ;; and DeepSeek on illatio does better thinking -- ppq's and OpenRouter's think by themselves)
+      (setf llm:*llm-effort* (or effort (and *chat-url* (not llm:*llm-effort*) :high) llm:*llm-effort*))
+      (format t "~&  reasoning: ~(~a~)~%" (or llm:*llm-effort* "the backend's default"))
       (when tools:*images* (format t "~&  pictures from ~a~%" (tools:images-label)) (force-output)))))
 
 (defun stop ()
