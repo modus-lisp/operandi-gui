@@ -56,7 +56,9 @@
  #rows li.think .dt .rs p{margin:0 0 6px} #rows li.think .dt .rs p:last-child{margin:0}
  #rows li.think .dt>:first-child{margin-top:0}
  #rows li.think .dt>:last-child{margin-bottom:0}
- #rows li.think.bare{display:none}
+ #rows li.think.bare{width:fit-content} #rows li.think.bare .dots i{display:inline-block;width:6px;height:6px;margin:0 2px;border-radius:50%;background:#7d8b98;animation:dot 1.2s infinite ease-in-out}
+ #rows li.think.bare .dots i:nth-child(2){animation-delay:.2s} #rows li.think.bare .dots i:nth-child(3){animation-delay:.4s}
+ @keyframes dot{0%,80%,100%{opacity:.25}40%{opacity:1}}
  body.tools #rows li.think .dt{display:block;margin-top:7px;font:11px/1.6 ui-monospace,Menlo,monospace;
    font-style:normal;color:#6f7c88;border-top:1px solid rgba(255,255,255,.08);padding-top:6px}
  body.tools #rows li.think.more::after{content:''}
@@ -173,9 +175,10 @@ function decorate(){                             // idempotent: warp repaints ro
     if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
       const raw=v.dataset.raw, nl=raw.indexOf(NL);              // the list folds under the status, a tap opens it
       const head=nl<0?raw:raw.slice(0,nl), rest=nl<0?'':raw.slice(nl+1).trim();
-      const html=md(head)+(rest?'<div class=dt>'+detail(rest)+'</div>':'');
+      const html=rest?md(head)+'<div class=dt>'+detail(rest)+'</div>'   // no calls yet: a pending reply, shown as dots
+                     :'<span class=dots><i></i><i></i><i></i></span>';
       if(v.innerHTML!==html)v.innerHTML=html;
-      if(!rest)bare=head;                         // no calls yet: no row, its status goes in the header
+      if(!rest)bare=head;                         // its status in the header too
       const want='think'+(rest?' more':' bare')+(rest&&li.dataset.open==='1'?' open':'');
       if(li.className!==want)li.className=want;  // the open flag lives in the dataset, where a repaint keeps it
       return;
