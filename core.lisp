@@ -266,7 +266,8 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                    (push (list :id id note) pics)))
                 ((string= role "user")
                  (flush) (setf calls 0)
-                 (when (and (stringp content) (plusp (length content)))
+                 (when (and (stringp content) (plusp (length content))
+                            (string/= content eng:+empty-turn-nudge+))     ; the engine's, not yours
                    (push (make-instance 'msg :id (incf *seq*) :role "you" :text content :kind :you) out)))
                 ((string= role "assistant")
                  (when (and (stringp reason) (plusp (length (string-trim " " reason))))
