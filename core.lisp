@@ -19,7 +19,7 @@
   (:export #:*model* #:*system-prompt* #:*tool-names*
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
            #:*proj* #:chat-projection
-           #:say #:stored-file #:file-payload #:new-session! #:open-session! #:delete-session! #:sessions-json #:current-session-id
+           #:say #:stored-file #:file-payload #:new-session! #:open-session! #:delete-session! #:upload! #:sessions-json #:current-session-id
            #:start-agent #:stop-agent
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
            #:set-model #:handle-command #:effort-label #:context-budget-k #:compact-at-k))
@@ -109,15 +109,19 @@ fabricate a value."
       (cdr (assoc path (ignore-errors (with-open-file (in f) (let ((*read-eval* nil)) (read in nil))))
                   :test #'equal)))))
 
-(defun store-file (path &optional (sid (current-session-id)))
-  "Copy PATH into chat SID's store; its id."
-  (let* ((bytes (read-octets path))
-         (id (string-downcase (subseq (format nil "~{~2,'0x~}" (coerce (sb-md5:md5sum-sequence bytes) 'list)) 0 12)))
-         (dest (merge-pathnames (format nil "~a/~a" id (file-namestring path)) (files-dir sid))))
+(defun store-octets (bytes name &optional (sid (current-session-id)))
+  "BYTES, a file named NAME, in chat SID's store; its id."
+  (let* ((id (string-downcase (subseq (format nil "~{~2,'0x~}" (coerce (sb-md5:md5sum-sequence bytes) 'list)) 0 12)))
+         (dest (merge-pathnames (format nil "~a/~a" id name) (files-dir sid))))
     (unless (stored-file id sid)
       (ensure-directories-exist dest)
       (with-open-file (o dest :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
         (write-sequence bytes o)))
+    id))
+
+(defun store-file (path &optional (sid (current-session-id)))
+  "Copy PATH into chat SID's store; its id."
+  (let ((id (store-octets (read-octets path) (file-namestring path) sid)))
     (let* ((f (index-file sid))
            (index (and (probe-file f) (ignore-errors (with-open-file (in f) (let ((*read-eval* nil)) (read in nil)))))))
       (unless (equal (cdr (assoc path index :test #'equal)) id)
@@ -126,22 +130,71 @@ fabricate a value."
           (with-standard-io-syntax (prin1 (acons path id (remove path index :key #'car :test #'equal)) o)))))
     id))
 
-(defun file-row-text (id sid &optional note)
+(defun file-row-text (id sid &optional note mine)
   (multiple-value-bind (path name size mime) (stored-file id sid)
     (when path
       (let ((h (llm:ht "id" id "name" name "size" size "mime" mime
                        "href" (format nil "/file/~a/~a" sid id))))
+        (when mine (setf (gethash "from" h) "you"))          ; an upload: on the operator's side
         (when (and (stringp note) (plusp (length note))) (setf (gethash "note" h) note))
         (when (llm:image-file-p name)
           (let ((url (ignore-errors (gethash "url" (gethash "image_url" (llm:image-part path :max-side *picture-side*))))))
             (when url (setf (gethash "preview" h) url))))
         (json:stringify h)))))
 
-(defun file-msg (id &optional (sid (current-session-id)) note)
-  "A row for stored file ID, captioned NOTE (an error row when it is gone)."
-  (let ((text (and id (file-row-text id sid note))))
+(defun file-msg (id &optional (sid (current-session-id)) note mine)
+  "A row for stored file ID, captioned NOTE (an error row when it is gone); MINE: the operator's upload."
+  (let ((text (and id (file-row-text id sid note mine))))
     (make-instance 'msg :id (incf *seq*) :role "operandi"
                         :text (or text "(a file that is no longer stored)") :kind (if text :file :err))))
+
+;;; An upload: the operator's file, stored as the agent's are, its row on their side.  It goes with
+;;; their next message: a note with its stored path (for tools: Imagine's image, Read) and, when it
+;;; is a picture, the picture, so the model sees it.
+(defvar *uploads* '() "Paths of the files uploaded since the operator's last message, oldest first.")
+(defparameter +upload-tag+ "[The user uploaded: ")
+(defparameter *upload-side* 1024 "Longest side, in pixels, of an uploaded picture as the model is shown it.")
+
+(defun upload-name (name)
+  "NAME made safe as a file name: its last component, letters, digits, . _ - kept."
+  (let* ((base (subseq name (1+ (or (position-if (lambda (c) (member c '(#\/ #\\))) name :from-end t) -1))))
+         (safe (map 'string (lambda (c) (if (or (alphanumericp c) (member c '(#\. #\_ #\-))) c #\_)) base))
+         (safe (string-left-trim "." safe)))
+    (if (plusp (length safe)) (subseq safe 0 (min 120 (length safe))) "upload")))
+
+(defun upload! (name bytes)
+  "The operator uploaded BYTES as NAME: stored in the open chat (one is opened if none is), its row
+   added, and held for their next message.  The stored id."
+  (unless *session* (new-session!))
+  (let* ((sid (current-session-id)) (id (store-octets bytes (upload-name name) sid)))
+    (bt:with-lock-held (*lock*)
+      (setf *messages* (append *messages* (list (file-msg id sid nil t)))
+            *uploads* (append *uploads* (list (namestring (stored-file id sid))))))
+    id))
+
+(defun user-content (text uploads)
+  "A user message's content: TEXT, and with UPLOADS a parts array, each file noted after it by path
+   and each picture shown."
+  (if (null uploads)
+      text
+      (coerce (cons (llm:ht "type" "text" "text" text)
+                    (loop for p in uploads
+                          collect (llm:ht "type" "text" "text" (format nil "~%~a~a]" +upload-tag+ p))
+                          when (llm:image-file-p p)
+                            collect (llm:image-part p :max-side *upload-side*)))
+              'vector)))
+
+(defun upload-parts (content)
+  "(values text paths) of a user message's CONTENT made by USER-CONTENT."
+  (let ((text '()) (paths '()))
+    (loop for part across content
+          for x = (and (hash-table-p part) (equal (gethash "type" part) "text") (gethash "text" part))
+          for line = (and x (string-trim '(#\Newline #\Space) x))
+          do (cond ((null line))
+                   ((and (eql 0 (search +upload-tag+ line)) (char= (char line (1- (length line))) #\]))
+                    (push (subseq line (length +upload-tag+) (1- (length line))) paths))
+                   (t (push x text))))
+    (values (format nil "~{~a~}" (reverse text)) (reverse paths))))
 
 (defun path-file-msg (path &optional (sid (current-session-id)))
   "A row for the file at PATH: its stored copy, storing it now if it never was."
@@ -264,6 +317,14 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                 ((and (string= role "tool") (sent-file-id content))
                  (multiple-value-bind (id note) (sent-file-id content)
                    (push (list :id id note) pics)))
+                ((and (string= role "user") (vectorp content))     ; a message with uploads
+                 (flush) (setf calls 0)
+                 (multiple-value-bind (text paths) (upload-parts content)
+                   (dolist (p paths)
+                     (let ((id (car (last (pathname-directory (pathname p))))))   ; the store's <id>/<name>
+                       (push (if (stored-file id sid) (file-msg id sid nil t) (path-file-msg p sid)) out)))
+                   (when (plusp (length (string-trim " " text)))
+                     (push (make-instance 'msg :id (incf *seq*) :role "you" :text text :kind :you) out))))
                 ((string= role "user")
                  (flush) (setf calls 0)
                  (when (and (stringp content) (plusp (length content))
@@ -290,7 +351,7 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 (defun new-session! ()
   "Start a fresh chat: a new session, an empty transcript, a greeting."
   (bt:with-lock-held (*lock*)
-    (setf *session* (session:make-session)
+    (setf *session* (session:make-session) *uploads* '()
           *messages* (list (make-instance 'msg :id (incf *seq*) :role "operandi"
                                           :text *greeting* :kind :bot))))
   (gethash :id *session*))
@@ -301,7 +362,7 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
   (let ((s (session:make-session)))
     (when (session:resume-session! s id)
       (bt:with-lock-held (*lock*)
-        (setf *session* s
+        (setf *session* s *uploads* '()
               *messages* (or (messages-from-history (session:session-history s))
                              (list (make-instance 'msg :id (incf *seq*) :role "operandi"
                                                   :text *greeting* :kind :bot)))))
@@ -636,6 +697,8 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 (defun answer (text)
   "Run one engine turn threaded onto the live session's history, and persist it."
   (let ((base (and *session* (session:session-history *session*)))
+        ;; the files uploaded since the last message go with this one
+        (content (user-content text (bt:with-lock-held (*lock*) (prog1 *uploads* (setf *uploads* '())))))
         (calls 0)
         (toks 0)
         (shown '()))                     ; pictures already given a row this turn
@@ -705,11 +768,11 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                      (%think! "…thinking~@[ · ~a so far~]"
                               (and (plusp calls)
                                    (format nil "~d tool call~:p" calls)))))))
-          (eng:run text
+          (eng:run content
                  ;; :history NIL on the first turn lets the engine seat the system
                  ;; prompt; thereafter we thread the accumulated history + new message.
                  :history (when base
-                            (append base (list (llm:ht "role" "user" "content" text))))
+                            (append base (list (llm:ht "role" "user" "content" content))))
                  :system *system-prompt*
                  :tool-names (append (or *tool-names* (tools:default-tools)) (list "SendFile"))
                  :verbose nil))

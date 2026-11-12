@@ -39,6 +39,7 @@
  #rows li.you{margin-left:auto;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
  #rows li.bot{margin-right:auto;background:#1b2430;border-bottom-left-radius:4px}
  #rows li.file{margin-right:auto;padding:0;background:none;white-space:normal}
+ #rows li.file.mine{margin-left:auto;margin-right:0}   /* an upload: the operator's side */
  #rows li.file .file{display:inline-block;max-width:100%;vertical-align:top}
  #rows li.file img{display:block;max-width:100%;max-height:min(70vh,calc(100vh - 210px));min-height:0;width:auto;height:auto;border-radius:10px 10px 0 0}
  #rows li.file .dl{display:block;padding:8px 13px;background:#1b2430;color:#dce4ec;text-decoration:none;
@@ -76,6 +77,8 @@
  #say{flex:1 1 auto;background:#161d27;border:1px solid #2a3644;border-radius:20px;
    color:#e6edf3;padding:11px 15px;font:15px/1.4 inherit;outline:none}
  #say:focus{border-color:#1f6feb}
+ #att{flex:0 0 auto;width:44px;padding:0;background:#161d27;border:1px solid #2a3644;color:#8b98a5;font-size:20px}
+ #att.busy{opacity:.5}
  button{background:#1f6feb;color:#fff;border:0;border-radius:20px;padding:0 18px;font:600 15px/1 inherit}
  button:disabled{opacity:.5}
  /* cold-start / Sessions picker */
@@ -103,6 +106,8 @@
    <button id=sess type=button>Sessions</button></header>
  <ul id=rows></ul><ul id=menu></ul>
  <form id=f autocomplete=off>
+   <button id=att type=button title='upload a picture or a file: it goes with your next message'>📎</button>
+   <input id=up type=file multiple hidden>
    <input id=say placeholder='Message operandi…' autofocus>
    <button type=submit>Send</button>
  </form>
@@ -167,9 +172,10 @@ function decorate(){                             // idempotent: warp repaints ro
     const v=li.querySelector('.v'); if(!v){if(li.className!==cls)li.className=cls;return;}
     if(v.dataset.raw===undefined)v.dataset.raw=v.textContent;   // capture source before we rewrite it
     if(tag==='file'){                            // a file: a download, with its picture when it is one
-      if(li.className!=='file')li.className='file';
-      if(!v.querySelector('.file')){let f=null;try{f=JSON.parse(v.dataset.raw);}catch(_){}
-        if(f){v.textContent='';v.appendChild(fileEl(f));}}
+      let f=null;try{f=JSON.parse(v.dataset.raw);}catch(_){}
+      const want=f&&f.from==='you'?'file mine':'file';   // an upload sits on the operator's side
+      if(li.className!==want)li.className=want;
+      if(f&&!v.querySelector('.file')){v.textContent='';v.appendChild(fileEl(f));}
       return;
     }
     if(cls==='think'){                           // <status> NL one line per finished call (client/chat.js):
@@ -232,6 +238,22 @@ f.addEventListener('submit',async e=>{
   say.focus();
 });
 
+// ---- uploads: each file stored in the chat now, sent with the next message ----
+const att=document.getElementById('att'), up=document.getElementById('up');
+att.onclick=()=>up.click();
+up.onchange=async()=>{
+  const files=[...up.files]; up.value=''; if(!files.length)return;
+  att.classList.add('busy'); atBottom=true;
+  for(const file of files){
+    try{const r=await fetch('/upload',{method:'POST',headers:{'X-Name':encodeURIComponent(file.name)},body:file});
+        if(!r.ok)alert('Upload failed: '+await r.text());}
+    catch(e){alert('Upload failed: '+e);}
+  }
+  att.classList.remove('busy');
+  if(!chatId)setChat((await (await fetch('/current')).text()).trim());
+  say.placeholder='Say what to do with it…'; say.focus();
+};
+
 // ---- session picker: shown cold, and via the Sessions button ----
 const picker=document.getElementById('picker'), slist=document.getElementById('slist');
 function fmtWhen(id){                             // ids are YYYYMMDD-HHMMSS
@@ -281,6 +303,19 @@ else showPicker();
 
 ;;; ------------------------------- server -------------------------------
 (defvar *sock* nil) (defvar *accept* nil)
+
+(defparameter *upload-max* (* 40 1024 1024) "The largest upload, in bytes.")
+
+(defun uri-decode (s)
+  "S with its %XX escapes decoded (UTF-8)."
+  (let ((out (make-array (length s) :element-type '(unsigned-byte 8) :fill-pointer 0 :adjustable t)) (i 0))
+    (loop while (< i (length s))
+          do (let ((c (char s i)))
+               (if (and (char= c #\%) (< (+ i 2) (length s)))
+                   (progn (vector-push-extend (parse-integer s :start (1+ i) :end (+ i 3) :radix 16) out) (incf i 3))
+                   (progn (loop for b across (babel:string-to-octets (string c) :encoding :utf-8) do (vector-push-extend b out))
+                          (incf i)))))
+    (babel:octets-to-string (coerce out '(simple-array (unsigned-byte 8) (*))) :encoding :utf-8 :errorp nil)))
 
 (defun read-body (stream headers)
   (let ((n (or (ignore-errors (parse-integer (cdr (assoc "content-length" headers :test #'string=)))) 0)))
@@ -332,6 +367,20 @@ else showPicker();
               (let ((body (read-body stream headers)))
                 (when (and body (plusp (length body))) (ignore-errors (say body))))
               (warp-dom::http-respond stream "200 OK" "text/plain" "ok"))
+             ;; POST /upload, X-Name: <name, URI-encoded>, the bytes: the operator's file (UPLOAD!)
+             ((and (string= method "POST") (eql 0 (search "/upload" path)))
+              (let* ((n (or (ignore-errors (parse-integer (cdr (assoc "content-length" headers :test #'string=)))) 0))
+                     (name (or (ignore-errors (uri-decode (cdr (assoc "x-name" headers :test #'string=)))) "upload")))
+                (cond ((not (< 0 n *upload-max*))
+                       (warp-dom::http-respond stream "413 Payload Too Large" "text/plain"
+                                               (format nil "a file up to ~d MB" (floor *upload-max* (* 1024 1024)))))
+                      (t (let ((buf (make-array n :element-type '(unsigned-byte 8))))
+                           (if (= n (read-sequence buf stream))
+                               (let ((id (handler-case (upload! name buf) (error (e) (princ-to-string e)))))
+                                 (if (file-id-p id)
+                                     (warp-dom::http-respond stream "200 OK" "text/plain" id)
+                                     (warp-dom::http-respond stream "500 Internal Server Error" "text/plain" id)))
+                               (warp-dom::http-respond stream "400 Bad Request" "text/plain" "the upload was cut short")))))))
              ;; GET /file/<session>/<id>: a file the agent handed over, from that chat's store
              ((and (string= method "GET") (eql 0 (search "/file/" path)))
               (let* ((parts (uiop:split-string (subseq path 6) :separator "/"))
