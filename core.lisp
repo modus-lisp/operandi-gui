@@ -20,7 +20,7 @@
            #:msg #:msg-id #:msg-text #:msg-kind #:chat-view #:row-type #:rows
            #:*proj* #:chat-projection
            #:say #:stored-file #:file-payload #:new-session! #:open-session! #:delete-session! #:upload! #:sessions-json #:current-session-id
-           #:start-agent #:stop-agent
+           #:start-agent #:stop-agent #:busy-p #:*row-previews* #:configure! #:preflight! #:*preflight-fn* #:url-label
            #:*speak-fn* #:*speak-enabled* #:speech-clean #:split-sentences
            #:set-model #:handle-command #:effort-label #:context-budget-k #:compact-at-k))
 (in-package #:operandi-gui)
@@ -57,15 +57,87 @@ fabricate a value."
 (defvar *seq* 0)
 (defvar *session* nil "the live operandi session (its :history threads across turns), or NIL when cold.")
 
+;;; ------------------------------- the agent ----------------------------
+;;; THE WORKER SHARES NOTHING WITH THE HOST.  The transcript (*MESSAGES*, *SESSION*, *UPLOADS*) is the
+;;; HOST's -- the thread that calls SAY and ROWS: a desk's frame loop, a server's connections.  The
+;;; worker owns the agent's side: the engine session it loads by id and saves after each turn, the live
+;;; status of the turn it is running.  They talk in two mailboxes of plain data: the host sends turns and
+;;; steers, the worker sends back what the chat should show (rows to open, text to put in them, the
+;;; reply), and ROWS applies that before every read.
+;;;
+;;; WHY.  On modus a thread's objects live in its own heap and the runtime refuses a store that would let
+;;; another thread reach one, so a worker that pushed rows into *MESSAGES* (as this one used to) has its
+;;; first reply refused.  A value crosses by being SENT -- copied -- which is what a modus channel does;
+;;; elsewhere the mailbox is a locked list, and the same code runs on both.
+
+(defstruct (mailbox (:constructor %make-mailbox)) chan lock cv (items '()))
+
+(defun make-mailbox (name)
+  "A mailbox between threads.  Made at run time, never in a saved image: a modus channel's lock and ring
+   belong to the process that made them."
+  #+modus (%make-mailbox :chan (modus:make-channel :name name))
+  #-modus (%make-mailbox :lock (bt:make-lock name) :cv (bt:make-condition-variable)))
+
+(defun mb-send (mb value)
+  "Send VALUE (plain data: lists, strings, numbers, symbols, hash tables) to MB's reader."
+  #+modus (modus:channel-send (mailbox-chan mb) value)
+  #-modus (bt:with-lock-held ((mailbox-lock mb))
+            (setf (mailbox-items mb) (nconc (mailbox-items mb) (list value)))
+            (bt:condition-notify (mailbox-cv mb)))
+  t)
+
+(defun mb-receive (mb)
+  "The next value in MB, waiting for one."
+  #+modus (values (modus:channel-receive (mailbox-chan mb)))
+  #-modus (bt:with-lock-held ((mailbox-lock mb))
+            (loop until (mailbox-items mb)
+                  do (bt:condition-wait (mailbox-cv mb) (mailbox-lock mb)))
+            (pop (mailbox-items mb))))
+
+(defun mb-try (mb)
+  "(values value T) for the next value in MB, or NIL NIL when there is none."
+  #+modus (modus:channel-try-receive (mailbox-chan mb))
+  #-modus (bt:with-lock-held ((mailbox-lock mb))
+            (if (mailbox-items mb) (values (pop (mailbox-items mb)) t) (values nil nil))))
+
+;; the host's side
+(defvar *inbox* nil "Host -> worker: (:turn TEXT UPLOADS SID), (:steer TEXT SID), (:stop).")
+(defvar *outbox* nil "Worker -> host: what the chat shows (see APPLY-EVENT).")
+(defvar *worker* nil) (defvar *running* nil)
+(defvar *pending* 0
+  "Turns sent and not yet finished.  Non-zero means a turn is running, so what the operator writes now
+   STEERS it (see SAY) rather than waiting behind it.")
+(defun busy-p () "A turn is running: what is said now steers it." (plusp *pending*))
+(defvar *think* nil "The live 'thinking' msg, or NIL -- the host's row for the worker's live status.")
+(defvar *row-of* (make-hash-table) "The worker's row tokens -> the host's msgs, for the running turn.")
+(defvar *pump-lock* (bt:make-lock "operandi-gui pump"))
+(defvar *replies* nil "Host -> worker: (ID RESULT), the answer to a tool the host ran for it (HOST-TOOLS).")
+
+;; TOOLS THAT RUN ON THE HOST.  On modus a worker thread cannot EVAL: compiling a form stores into the
+;; image's shared tables, and the store is refused.  So the tools that evaluate are run by the host, in
+;; its PUMP, and the worker waits for the answer.  Elsewhere a worker evaluates as well as any thread.
+(defparameter *host-tools* #+modus '("Eval") #-modus '()
+  "Tools whose bodies the HOST runs for the worker.")
+(defvar *host-tool-impls* (make-hash-table :test 'equal) "Name -> the tool's own implementation.")
+(defvar *host-call-n* 0)
+
+;; the worker's side, bound in its thread only
+(defvar *worker-out* nil "The outbox, in the worker; NIL on the host.  How a function knows which side it is on.")
+(defvar *wsession* nil "The worker's engine session.")
+(defvar *think-k* nil "The worker's token for its live row, or NIL.")
+(defvar *think-n* 0)
+(defvar *later* '() "Turns the worker read while draining steers, to run after this one.")
+(defvar *stopping* nil)
+
 ;;; ------------------------------- files --------------------------------
 ;;; A file the agent hands over -- a picture Imagine made or Read opened, anything SendFile sends --
 ;;; is COPIED into this chat's own store, ~/.operandi/chat-files/<session>/<id>/<name>, and its row
 ;;; refers to the copy: a transcript must not break when the original moves.  The id is the start
-;;; of the content's MD5, so the same bytes sent twice are one file.  A row's text is JSON
+;;; of the content's SHA-256 (natrium's, which operandi already carries -- sb-md5 is SBCL's alone), so the
+;;; same bytes sent twice are one file.  A row's text is JSON
 ;;; {id,name,size,mime,href,preview}: HREF downloads it from the HTTP host; the phone, which has
 ;;; no HTTP, asks the gateway for the bytes (FILE-PAYLOAD); PREVIEW, for a picture, is a data: URL
 ;;; shrunk to *PICTURE-SIDE*, so the row shows it at a glance.
-(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-md5))
 
 (defparameter *files-root* (merge-pathnames ".operandi/chat-files/" (user-homedir-pathname)))
 (defparameter *picture-side* 768 "Longest side, in pixels, of a picture's preview.")
@@ -111,7 +183,7 @@ fabricate a value."
 
 (defun store-octets (bytes name &optional (sid (current-session-id)))
   "BYTES, a file named NAME, in chat SID's store; its id."
-  (let* ((id (string-downcase (subseq (format nil "~{~2,'0x~}" (coerce (sb-md5:md5sum-sequence bytes) 'list)) 0 12)))
+  (let* ((id (string-downcase (subseq (format nil "~{~2,'0x~}" (coerce (natrium:sha256 (coerce bytes '(simple-array (unsigned-byte 8) (*)))) 'list)) 0 12)))
          (dest (merge-pathnames (format nil "~a/~a" id name) (files-dir sid))))
     (unless (stored-file id sid)
       (ensure-directories-exist dest)
@@ -130,6 +202,11 @@ fabricate a value."
           (with-standard-io-syntax (prin1 (acons path id (remove path index :key #'car :test #'equal)) o)))))
     id))
 
+(defvar *row-previews* t
+  "Whether a picture's row carries a small copy of it (\"preview\", a data: URL) for a client that
+   draws from the row alone -- the browser.  Making one decodes the picture in Lisp; a phone draws
+   its own thumbnails natively and turns this off.")
+
 (defun file-row-text (id sid &optional note mine)
   (multiple-value-bind (path name size mime) (stored-file id sid)
     (when path
@@ -137,7 +214,7 @@ fabricate a value."
                        "href" (format nil "/file/~a/~a" sid id))))
         (when mine (setf (gethash "from" h) "you"))          ; an upload: on the operator's side
         (when (and (stringp note) (plusp (length note))) (setf (gethash "note" h) note))
-        (when (llm:image-file-p name)
+        (when (and *row-previews* (llm:image-file-p name))
           (let ((url (ignore-errors (gethash "url" (gethash "image_url" (llm:image-part path :max-side *picture-side*))))))
             (when url (setf (gethash "preview" h) url))))
         (json:stringify h)))))
@@ -214,7 +291,7 @@ fabricate a value."
                           ((> size *phone-file-max*)
                            (llm:ht "id" id "error" (format nil "~a is ~:d bytes: download it from the desktop page" name size)))
                           (t (llm:ht "id" id "name" name "mime" mime
-                                     "b64" (cl-base64:usb8-array-to-base64-string (read-octets path)))))))))
+                                     "b64" (operandi.http:base64-string (read-octets path)))))))))
 
 (defun tool-picture-paths (content)
   "The paths in an engine tool-pictures message (operandi.engine's TOOL-IMAGES-MSG), or NIL when
@@ -244,9 +321,15 @@ fabricate a value."
 (defun add-row (row)
   (bt:with-lock-held (*lock*) (setf *messages* (append *messages* (list row)))))
 
+(defun %emit (&rest event)
+  "From the worker: tell the host what the chat should show (APPLY-EVENT)."
+  (mb-send *worker-out* event))
+
 (defun add-file-row (id sid &optional note)
   "A row for stored file ID -- unless the chat already shows it, as when SendFile hands over the
-   picture Imagine just made; a NOTE then captions the row already there."
+   picture Imagine just made; a NOTE then captions the row already there.  From the worker, the host
+   is asked to (the row is the host's)."
+  (when *worker-out* (return-from add-file-row (%emit :file id sid note)))
   (let ((there (bt:with-lock-held (*lock*) (find id *messages* :key #'file-row-id :test #'equal))))
     (cond ((null there) (add-row (file-msg id sid note)))
           ((and (stringp note) (plusp (length note)))
@@ -265,7 +348,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
  (lambda (args)
    (let ((path (gethash "path" args)) (sid (current-session-id)))
      (cond ((not sid) "SendFile: no chat is open")
-           ((not (and (stringp path) (probe-file path) (uiop:file-exists-p path)))
+           ;; a file, not a directory: PROBE-FILE alone (modus's UIOP has no FILE-EXISTS-P)
+           ((not (and (stringp path)
+                      (let ((p (probe-file path))) (and p (pathname-name p)))))
             (format nil "SendFile: no such file: ~a" path))
            (t (let ((id (store-file (namestring (truename path)) sid))
                     (note (let ((n (gethash "note" args)))
@@ -283,7 +368,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 ;;; ---------------------------- sessions --------------------------------
 (defparameter *greeting* "Hi — I'm operandi. Ask me anything.")
 
-(defun current-session-id () (and *session* (gethash :id *session*)))
+(defun current-session-id ()
+  "The open chat's id -- in the worker, the chat of the turn it is running."
+  (let ((s (or *wsession* *session*))) (and s (gethash :id s))))
 
 (defun messages-from-history (hist)
   "Rebuild the visible transcript from a resumed session's engine history: the user and
@@ -317,7 +404,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                 ((and (string= role "tool") (sent-file-id content))
                  (multiple-value-bind (id note) (sent-file-id content)
                    (push (list :id id note) pics)))
-                ((and (string= role "user") (vectorp content))     ; a message with uploads
+                ;; a message with uploads: a parts VECTOR -- not a string, which is a vector too, and
+                ;; was taken for one, so every plain message vanished from a reopened chat
+                ((and (string= role "user") (vectorp content) (not (stringp content)))
                  (flush) (setf calls 0)
                  (multiple-value-bind (text paths) (upload-parts content)
                    (dolist (p paths)
@@ -392,15 +481,16 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
     (unless (or (probe-file json) (probe-file md)) (return-from delete-session! :missing))
     (bt:with-lock-held (*lock*)
       (when (equal id (current-session-id))
-        (when (or *think* *queue*) (return-from delete-session! :busy))
+        (when (plusp *pending*) (return-from delete-session! :busy))
         (setf *session* nil *messages* '())))
     (ensure-directories-exist to)
     (flet ((move (from to)            ; rename(2): the same filesystem, files or directories
-             (multiple-value-bind (ok err) (sb-unix:unix-rename from to)
-               (unless ok (error "cannot move ~A to ~A: ~A" from to (sb-int:strerror err))))))
+             #+sbcl (multiple-value-bind (ok err) (sb-unix:unix-rename from to)
+                      (unless ok (error "cannot move ~A to ~A: ~A" from to (sb-int:strerror err))))
+             #-sbcl (rename-file from to)))
       (dolist (f (list json md))
         (when (probe-file f) (move (namestring f) (namestring (merge-pathnames (file-namestring f) to)))))
-      (when (uiop:directory-exists-p files)
+      (when (ignore-errors (probe-file files))       ; modus's UIOP has no DIRECTORY-EXISTS-P
         (move (string-right-trim "/" (namestring files)) (namestring (merge-pathnames "files" to)))))
     :deleted))
 
@@ -426,7 +516,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 
 (defun rows ()
   "The QUERY: the conversation as domain objects (a transient 'thinking' row while
-   the agent works, so the client sees progress)."
+   the agent works, so the client sees progress).  What the worker has sent is applied first, so every
+   read is current and nothing else has to pump."
+  (pump)
   (bt:with-lock-held (*lock*)
     (copy-list *messages*)))
 (defun row-type (o) (declare (ignore o)) 'msg)
@@ -434,15 +526,6 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 (defvar *proj* (w:make-projection #'rows :type-fn #'row-type))
 (defun chat-projection () *proj*)
 
-;;; ------------------------------- the agent ----------------------------
-(defvar *queue* '()) (defvar *qlock* (bt:make-lock "chat-q")) (defvar *qcv* (bt:make-condition-variable))
-(defvar *steer* '()
-  "Words written while a turn is ALREADY running.  They do not wait for it —
-   ENG:*STEER-FN* drains this between iterations and appends them to the running
-   conversation, so they redirect the work in flight.  Queuing them instead is
-   what made \"continue\" the only usable thing to say: by the time a queued
-   message is read, the turn you wanted to change is over.")
-(defvar *worker* nil) (defvar *running* nil) (defvar *think* nil "the live 'thinking' msg, or NIL.")
 
 ;; Voice output is the host's to provide (the gateway routes it to the desktop's chord voice; a
 ;; local server could synthesize to the browser). Core just offers the hook + the toggle.
@@ -454,14 +537,111 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 ;;; app has.  A line beginning with / is the GUI's own and never reaches the agent.
 
 (defvar *backend* :openrouter
-  "Where the chat's model runs when *CHAT-URL* names no local server: :OPENROUTER or :PPQ.")
+  "Where the chat's model runs when *CHAT-URL* names no local server: :OPENROUTER, :PPQ, :ROUTSTR,
+   :TINFOIL or :MAPLE (CONFIGURE! sets it; :PPQ and :OPENROUTER read their key files when it has not).")
+(defvar *backend-token* nil
+  "The key CONFIGURE! was given (a phone's keychain), or NIL: the setters then read their key files.")
+(defvar *backend-url* nil "Routstr's node, when CONFIGURE! named one.")
+
+(defun %set-backend (backend slug)
+  "Point the engine at SLUG on BACKEND, with the key and node CONFIGURE! was given.  T, or NIL when the
+   setter refused (no key)."
+  (let ((tok *backend-token*))
+    (ecase backend
+      (:openrouter (llm:set-backend-openrouter! :model slug :token tok))
+      (:ppq (llm:set-backend-ppq! :model slug :token tok))
+      (:routstr (apply #'llm:set-backend-routstr! :model slug :token tok
+                       (and *backend-url* (list :url *backend-url*))))
+      (:tinfoil (llm:set-backend-tinfoil! :model slug :token tok))
+      (:maple (llm:set-backend-maple! :model slug :token tok)))))
 
 (defun use-model (slug)
   "Point the engine at SLUG: on the local server when *CHAT-URL* is set (SLUG NIL asks it what it
    serves), else on *BACKEND*."
-  (cond (*chat-url* (llm:set-backend-llama! :url *chat-url* :model slug))
-        ((eq *backend* :ppq) (llm:set-backend-ppq! :model slug))
-        (t (llm:set-backend-openrouter! :model slug))))
+  (if *chat-url*
+      (llm:set-backend-llama! :url *chat-url* :model slug)
+      (%set-backend *backend* slug)))
+
+;;; THE SETTINGS PANEL'S ENTRY.  Everything the agent's inference depends on, set at once and checked
+;;; before it is kept: a choice that cannot work (no key; --confidential on a path that is not sealed, or
+;;; whose operator TRUST does not name) leaves the agent as it was and says why.  It changes globals the
+;;; worker reads, so it runs on the HOST and not while a turn is running.
+
+(defparameter +config-vars+
+  '(llm:*llm-backend* llm:*llm-url* llm:*llm-auth-token* llm:*llm-model* llm:*llm-read-timeout*
+    llm:*sealed-post* llm:*confidential* llm:*trust* llm:*maple-mode* llm:*llm-effort*
+    *chat-url* *backend* *backend-token* *backend-url* *model*)
+  "What CONFIGURE! may change, and so puts back when the new choice is refused.")
+
+(defun configure! (&key backend token model url confidential trust effort)
+  "Point the agent at BACKEND -- :OPENROUTER :PPQ :ROUTSTR :TINFOIL :MAPLE, or :LOCAL (an OpenAI-compatible
+   server at URL: illatio, llama.cpp) -- with TOKEN (its key), MODEL (NIL: the backend's default, or what a
+   local server serves), URL (a local server's address; Routstr's node, NIL for the default),
+   CONFIDENTIAL (every request sealed to an attested enclave, else refused), TRUST (the --trust names, a
+   list of strings) and EFFORT (NIL, :OFF, :LOW, :MEDIUM, :HIGH).
+   Returns (values T label) when it took, else (values NIL reason) with nothing changed."
+  (when (busy-p)
+    (return-from configure! (values nil "A turn is running; change the settings when it has finished.")))
+  (let ((saved (mapcar #'symbol-value +config-vars+)))
+    (flet ((refuse (why)
+             (mapc #'set +config-vars+ saved)
+             (return-from configure! (values nil why))))
+      (handler-case
+          (progn
+            (setf llm:*confidential* nil
+                  llm:*trust* (copy-list trust)
+                  llm:*llm-effort* effort
+                  *backend-token* (and token (plusp (length token)) token))
+            (cond ((eq backend :local)
+                   (unless (and url (plusp (length url))) (refuse "A local server needs its address."))
+                   (setf *chat-url* (llm:llama-chat-url url))
+                   (llm:set-backend-llama! :url *chat-url* :model (and model (plusp (length model)) model)))
+                  (t
+                   (setf *chat-url* nil *backend* backend
+                         *backend-url* (and (eq backend :routstr) url (plusp (length url)) url))
+                   (unless *backend-token* (refuse "This backend needs an API key."))
+                   (unless (if (and model (plusp (length model)))
+                               (%set-backend backend model)
+                               ;; the setter's own default model
+                               (let ((tok *backend-token*))
+                                 (ecase backend
+                                   (:openrouter (llm:set-backend-openrouter! :token tok))
+                                   (:ppq (llm:set-backend-ppq! :token tok :confidential confidential))
+                                   (:routstr (apply #'llm:set-backend-routstr! :token tok :confidential confidential
+                                                    (and *backend-url* (list :url *backend-url*))))
+                                   (:tinfoil (llm:set-backend-tinfoil! :token tok))
+                                   (:maple (llm:set-backend-maple! :token tok)))))
+                     (refuse "The backend refused those settings."))))
+            (when confidential
+              (llm:enable-confidential!)
+              (let ((why (llm:confidential-refusal)))
+                (when why (refuse (format nil "Confidential: ~a." why)))))
+            (setf *model* llm:*llm-model*)
+            (values t (format nil "~a on ~a~:[~; (confidential)~]"
+                              (or llm:*llm-model* "the server's model")
+                              (case backend
+                                (:local (url-label *chat-url*)) (:openrouter "OpenRouter") (:ppq "PPQ") (:routstr "Routstr")
+                                (:tinfoil "Tinfoil") (:maple "Maple") (t backend))
+                              llm:*confidential*)))
+        (error (e) (refuse (princ-to-string e)))))))
+
+(defun url-label (url)
+  "A server's address as a person reads it: no scheme, no /v1/chat/completions."
+  (let* ((u (or url ""))
+         (u (let ((p (search "://" u))) (if p (subseq u (+ p 3)) u)))
+         (p (search "/v1/chat/completions" u)))
+    (if p (subseq u 0 p) (string-right-trim "/" u))))
+
+(defvar *preflight-fn* nil
+  "(lambda (ok reason)), called on the host when a PREFLIGHT! the worker ran has an answer.")
+
+(defun preflight! ()
+  "Ask the worker to send the current backend a one-token ping (ENG:PREFLIGHT-MODEL): on the worker, so
+   the window that asked does not stop while it waits.  *PREFLIGHT-FN* gets the answer.  NIL when there is
+   no worker or a turn is running."
+  (when (and *inbox* (not (busy-p)))
+    (mb-send *inbox* (list :preflight))
+    t))
 
 (defun set-model (slug)
   "Switch the agent to SLUG — but PROVE it first.  ENG:PREFLIGHT-MODEL sends a one-token ping and
@@ -568,22 +748,19 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
         (cond
           ;; the GUI is answering, so it lands as a reply and nothing is queued for the engine
           (cmd (add-msg "operandi" cmd :bot))
-          ;; A turn is in flight: STEER it rather than queue behind it.  *THINK* is
-          ;; the live turn's own row, so it is exactly "is the worker busy" without
-          ;; a second flag that could disagree with it.
-          (*think*
-           (bt:with-lock-held (*qlock*)
-             (setf *steer* (nconc *steer* (list s))))
-           ;; SPLIT THE ROLLUP.  The :YOU row for this message was appended just above,
-           ;; so freezing the current row here and opening a new one puts the steer
-           ;; BETWEEN the calls it interrupted and the calls it caused.  Left as one
-           ;; row, the live status keeps updating above the message that redirected it,
-           ;; which reads as though the steer did nothing.
-           (%think-open! "↪ steering…"))
+          ((null *inbox*)
+           (add-msg "operandi" "The agent isn't running." :err))
+          ;; A turn is in flight: STEER it rather than queue behind it.  Words that wait for
+          ;; the turn to end arrive after the turn you wanted to change is over -- which is
+          ;; what made "continue" the only usable thing to say.  The worker hands them to the
+          ;; engine between iterations (ENG:*STEER-FN*) and splits its live row there, so the
+          ;; calls the steer caused sit below it (WORKER-STEERS).
+          ((plusp *pending*)
+           (mb-send *inbox* (list :steer s (current-session-id))))
           (t
-           (bt:with-lock-held (*qlock*)
-             (setf *queue* (nconc *queue* (list s)))
-             (bt:condition-notify *qcv*))))))))
+           (incf *pending*)
+           (mb-send *inbox* (list :turn s (bt:with-lock-held (*lock*) (prog1 *uploads* (setf *uploads* '())))
+                                  (current-session-id)))))))))
 
 ;;; --------------------------- live status ------------------------------
 ;;; A turn can run for minutes across dozens of tool calls, and the panel said
@@ -591,6 +768,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
 ;;; thing a chat UI most needs to not look like.  The row is already updated in
 ;;; place at the end of the turn (same id -> a :changed delta), so saying more
 ;;; costs nothing new: rewrite the SAME row as the work happens.
+;;;
+;;; ALL OF THIS RUNS IN THE WORKER (its variables are bound there, WORKER-LOOP): the row is the
+;;; host's, so the worker names it by a token of its own and sends its text (%EMIT).
 
 (defvar *think-head* "" "The one-line status: what the turn is doing RIGHT NOW.")
 (defvar *tool-log* '() "What it has already done this leg, newest first.")
@@ -628,8 +808,8 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
   "Compose the row: status line first, detail below.  FIRST is deliberate — the
    collapsed row shows only its first line, so the live status has to be that
    line, and the detail is what tapping reveals."
-  (let ((m *think*))
-    (when m
+  (let ((k *think-k*))
+    (when k
       (let* ((live (and (plusp *think-reason-n*)
                         (%clip-reason (let ((r (get-output-stream-string *think-reason*)))
                                         (write-string r *think-reason*)   ; read without losing it
@@ -637,7 +817,7 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
              (log (append (reverse (subseq *tool-log* 0 (min *tool-log-keep* (length *tool-log*))))
                           (and live (list live))))
              (text (if log (format nil "~a~%~{~a~%~}" *think-head* log) *think-head*)))
-        (bt:with-lock-held (*lock*) (setf (msg-text m) text))))))
+        (%emit :think-text k text)))))
 
 (defun %think! (fmt &rest args)
   "Set the status line.  A no-op when no turn is running, so a stray hook from a
@@ -654,10 +834,10 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
   "Leave the live row as what its leg did: a summary over its calls and reasoning, or nothing at
    all when it did neither (a bare \"…thinking…\" is no record of anything)."
   (%reason-flush)
-  (when *think*
+  (when *think-k*
     (if *tool-log*
         (%think! "~a" (%think-summary *tool-log*))
-        (bt:with-lock-held (*lock*) (setf *messages* (remove *think* *messages*))))))
+        (progn (%emit :think-drop *think-k*) (setf *think-k* nil)))))
 
 (defun %think-open! (head)
   "Start a FRESH rollup row with HEAD as its status, leaving the previous row
@@ -666,7 +846,8 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
    rolling them into one line puts the work above the words that caused it."
   (%think-close!)
   (setf *tool-log* '() *think-head* head *think-reason-n* 0)
-  (setf *think* (add-msg "operandi" head :think)))
+  (setf *think-k* (incf *think-n*))
+  (%emit :think-open *think-k* head))
 
 (defun %arg-detail (args)
   "Like %ARG-BRIEF but roomier — the detail list is read deliberately, so it can
@@ -694,11 +875,11 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                       one)))
         cut))))
 
-(defun answer (text)
-  "Run one engine turn threaded onto the live session's history, and persist it."
-  (let ((base (and *session* (session:session-history *session*)))
+(defun answer (text uploads)
+  "In the worker: run one engine turn threaded onto its session's history, and persist it."
+  (let ((base (and *wsession* (session:session-history *wsession*)))
         ;; the files uploaded since the last message go with this one
-        (content (user-content text (bt:with-lock-held (*lock*) (prog1 *uploads* (setf *uploads* '())))))
+        (content (user-content text uploads))
         (calls 0)
         (toks 0)
         (shown '()))                     ; pictures already given a row this turn
@@ -731,7 +912,9 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                              (unless (member p shown :test #'string=)
                                (push p shown)
                                (let ((id (ignore-errors (store-file p))))
-                                 (if id (add-file-row id (current-session-id)) (add-row (path-file-msg p))))))))
+                                 (if id
+                                     (add-file-row id (current-session-id))
+                                     (%emit :path p (current-session-id))))))))
                        hooks:*post-tool-hooks*))
                ;; Compaction is the longest silent pause in a run: it summarises the
                ;; whole span with a second model call.  Name it, or it reads as a hang.
@@ -748,9 +931,11 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                ;; two consecutive user turns the model has to reconcile.
                (eng:*steer-fn*
                  (lambda ()
-                   (let ((pending (bt:with-lock-held (*qlock*)
-                                    (prog1 *steer* (setf *steer* '())))))
+                   (let ((pending (worker-steers)))
                      (when pending
+                       ;; SPLIT THE ROLLUP: the calls before the steer and the calls it causes are
+                       ;; answers to different instructions -- a fresh row, below the steer's
+                       (%think-open! "↪ steering…")
                        (format nil "~{~A~^~%~%~}" pending)))))
                (eng:*on-reasoning*
                  (lambda (chunk)
@@ -776,10 +961,10 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
                  :system *system-prompt*
                  :tool-names (append (or *tool-names* (tools:default-tools)) (list "SendFile"))
                  :verbose nil))
-      (when *session*
-        (setf (gethash :history *session*) hist)
-        (incf (gethash :turns *session*))
-        (ignore-errors (session:persist-session *session*)))     ; crash never loses a turn
+      (when *wsession*
+        (setf (gethash :history *wsession*) hist)
+        (incf (gethash :turns *wsession*))
+        (ignore-errors (session:persist-session *wsession*)))     ; crash never loses a turn
       (let ((r (string-trim '(#\Space #\Newline #\Return #\Tab) (or reply ""))))
         (if (plusp (length r)) r "(no reply produced)")))))
 
@@ -845,58 +1030,168 @@ a CSV, an archive, a picture.  NOTE, optional, is a line shown with it."
       (emit n))
     (nreverse out)))
 
-(defun worker-loop ()
-  (loop while *running* do
-    (let ((text (bt:with-lock-held (*qlock*)
-                  (loop until (or (not *running*) *queue*)
-                        do (bt:condition-wait *qcv* *qlock*))
-                  (and *queue* (pop *queue*)))))
-      (when text
-        (setf *tool-log* '() *think-head* "…thinking…" *think-reason-n* 0)
-        (get-output-stream-string *think-reason*)
-        (setf *think* (add-msg "operandi" "…thinking…" :think))
-        (multiple-value-bind (reply kind)
-            (handler-case (values (answer text) :bot)
-              (serious-condition (e) (values (format nil "Something went wrong: ~A" e) :err)))
-          ;; A turn that used tools keeps its row, the status now a summary and the calls still
-          ;; under it, and the reply is a row of its own; a turn that did not is just its reply,
-          ;; written over the thinking row (same id -> a :changed delta).
-          (%reason-flush)
-          (let ((mid (if *tool-log*
-                         (progn (%think-close!)
-                                (msg-id (add-msg "operandi" reply kind)))
-                         (progn (bt:with-lock-held (*lock*)
-                                  (setf (msg-text *think*) reply
-                                        (slot-value *think* 'kind) kind))
-                                (msg-id *think*)))))
-            (setf *think* nil)
-            ;; A steer written in the gap between the engine's last drain and the
-            ;; turn ending has nowhere to land — it must not evaporate.  Promote it
-            ;; to the turn queue so it starts the next turn instead.
-            (let ((late (bt:with-lock-held (*qlock*)
-                          (prog1 *steer* (setf *steer* '())))))
-              (when late
-                (bt:with-lock-held (*qlock*)
-                  (setf *queue* (nconc *queue* late))
-                  (bt:condition-notify *qcv*))))
-            ;; voice a real answer (not an error) if the operator turned it on.  We hand the RAW
-            ;; reply + its row id; the host splits into sentences, cleans each for the voice, and
-            ;; drives the highlight (payload.js re-splits the SAME raw text to find the spans).
-            (when (and (eq kind :bot) *speak-enabled* *speak-fn*)
-              (ignore-errors (funcall *speak-fn* reply mid)))))))))
+;;; ------------------------------ the worker ----------------------------
+(defun worker-session (sid)
+  "The worker's session for chat SID: the one it has, else read from disk, else a fresh one under that
+   id (a chat the host opened and nothing has saved yet)."
+  (unless (and *wsession* (equal (gethash :id *wsession*) sid))
+    (setf *wsession* (let ((s (session:make-session)))
+                       (unless (and sid (session:resume-session! s sid))
+                         (when sid (setf (gethash :id s) sid)))
+                       s)))
+  *wsession*)
+
+(defun worker-steers ()
+  "Drain the inbox between engine iterations: the steers' texts, oldest first.  A turn read here waits
+   in *LATER*; a stop is remembered."
+  (let ((out '()))
+    (loop (multiple-value-bind (m ok) (mb-try *inbox*)
+            (unless ok (return))
+            (case (first m)
+              (:steer (push (second m) out))
+              (:turn (setf *later* (append *later* (list m))))
+              (:stop (setf *stopping* t)))))
+    (nreverse out)))
+
+(defun worker-turn (text uploads sid)
+  (worker-session sid)
+  (setf *tool-log* '() *think-head* "…thinking…" *think-reason-n* 0)
+  (get-output-stream-string *think-reason*)
+  (setf *think-k* (incf *think-n*))
+  (%emit :think-open *think-k* "…thinking…")
+  (multiple-value-bind (reply kind)
+      (handler-case (values (answer text uploads) :bot)
+        (serious-condition (e) (values (format nil "Something went wrong: ~A" e) :err)))
+    ;; A turn that used tools keeps its row, the status now a summary and the calls still
+    ;; under it, and the reply is a row of its own; a turn that did not is just its reply,
+    ;; written over the thinking row (same id -> a :changed delta).
+    (%reason-flush)
+    (if *tool-log*
+        (progn (%think-close!) (%emit :reply nil reply kind))
+        (%emit :reply *think-k* reply kind))
+    (setf *think-k* nil)
+    ;; A steer written in the gap between the engine's last drain and the turn ending has
+    ;; nowhere to land -- it must not evaporate.  It starts the next turn instead (counted
+    ;; before this one is finished, so the host never sees the agent idle in between).
+    (let ((late (worker-steers)))
+      (when late
+        (%emit :extra-turn)
+        (setf *later* (append *later* (list (list :turn (format nil "~{~A~^~%~%~}" late) nil sid))))))
+    (%emit :turn-done)))
+
+(defun worker-loop (inbox outbox)
+  "The worker thread: turns from INBOX, one at a time; what the chat should show to OUTBOX.  Every
+   variable it writes is bound here, so it is this thread's own."
+  (let ((*inbox* inbox) (*worker-out* outbox) (*wsession* nil)
+        (*think-k* nil) (*think-n* 0) (*later* '()) (*stopping* nil) (*host-call-n* 0)
+        (*think-head* "") (*tool-log* '()) (*think-reason* (make-string-output-stream)) (*think-reason-n* 0))
+    (loop until *stopping* do
+      (let ((m (or (pop *later*) (mb-receive inbox))))
+        (case (first m)
+          (:stop (setf *stopping* t))
+          (:preflight (multiple-value-bind (ok reason) (eng:preflight-model)
+                        (%emit :preflight (and ok t) (and reason (princ-to-string reason)))))
+          ;; a steer that finds no turn running is a turn
+          ((:turn :steer)
+           (destructuring-bind (text &optional uploads sid)
+               (if (eq (first m) :steer) (list (second m) nil (third m)) (rest m))
+             (when (eq (first m) :steer) (%emit :extra-turn))
+             (handler-case (worker-turn text uploads sid)
+               (serious-condition (e)
+                 (ignore-errors (%emit :reply nil (format nil "Something went wrong: ~A" e) :err))
+                 (ignore-errors (%emit :turn-done)))))))))))
+
+;;; ------------------------------ the host ------------------------------
+(defun apply-event (ev)
+  "On the host: one thing the worker said the chat should show."
+  (destructuring-bind (kind &rest args) ev
+    (ecase kind
+      (:preflight (when *preflight-fn* (apply *preflight-fn* args)))
+      (:think-open (destructuring-bind (k text) args
+                     (setf *think* (add-msg "operandi" text :think)
+                           (gethash k *row-of*) *think*)))
+      (:think-text (destructuring-bind (k text) args
+                     (let ((m (gethash k *row-of*)))
+                       (when m (bt:with-lock-held (*lock*) (setf (msg-text m) text))))))
+      (:think-drop (let ((m (gethash (first args) *row-of*)))
+                     (when m
+                       (remhash (first args) *row-of*)
+                       (when (eq m *think*) (setf *think* nil))
+                       (bt:with-lock-held (*lock*) (setf *messages* (remove m *messages*))))))
+      (:reply (destructuring-bind (k reply kind) args
+                (let* ((m (and k (gethash k *row-of*)))
+                       (mid (if m
+                                (progn (bt:with-lock-held (*lock*)
+                                         (setf (msg-text m) reply (slot-value m 'kind) kind))
+                                       (msg-id m))
+                                (msg-id (add-msg "operandi" reply kind)))))
+                  (setf *think* nil)
+                  ;; voice a real answer (not an error) if the operator turned it on.  We hand the RAW
+                  ;; reply + its row id; the host splits into sentences, cleans each for the voice, and
+                  ;; drives the highlight (payload.js re-splits the SAME raw text to find the spans).
+                  (when (and (eq kind :bot) *speak-enabled* *speak-fn*)
+                    (ignore-errors (funcall *speak-fn* reply mid))))))
+      (:file (destructuring-bind (id sid note) args (add-file-row id sid note)))
+      (:path (destructuring-bind (path sid) args (add-row (path-file-msg path sid))))
+      (:tool (destructuring-bind (id name args) args
+               (let ((impl (gethash name *host-tool-impls*)))
+                 (mb-send *replies*
+                          (list id (if impl
+                                       (handler-case (funcall impl args)
+                                         (serious-condition (e) (format nil "TOOL ERROR: ~a" e)))
+                                       (format nil "TOOL ERROR: ~a is not a host tool" name)))))))
+      (:extra-turn (incf *pending*))
+      (:turn-done (setf *pending* (max 0 (1- *pending*)) *think* nil)
+                  (clrhash *row-of*)))))
+
+(defun host-tool-call (name args)
+  "In the worker: have the host run tool NAME on ARGS, and wait for its answer."
+  (let ((id (incf *host-call-n*)))
+    (%emit :tool id name args)
+    (loop (destructuring-bind (rid result) (mb-receive *replies*)
+            (when (eql rid id) (return result))))))
+
+(defun install-host-tools ()
+  "On the host, once: each of *HOST-TOOLS* keeps its implementation here and is replaced, for the
+   engine, by a call to the host."
+  (let ((tools (symbol-value (find-symbol "*TOOLS*" "OPERANDI.TOOLS"))))
+    (dolist (name *host-tools*)
+      (let ((tool (gethash name tools)))
+        (when (and tool (not (gethash name *host-tool-impls*)))
+          (setf (gethash name *host-tool-impls*) (getf tool :impl))
+          (setf (gethash name tools)
+                (list* :impl (let ((n name)) (lambda (args) (host-tool-call n args)))
+                       (loop for (k v) on tool by #'cddr unless (eq k :impl) nconc (list k v)))))))))
+
+(defun pump ()
+  "Apply everything the worker has sent.  ROWS calls it, so a host that reads the chat pumps it."
+  (when *outbox*
+    (bt:with-lock-held (*pump-lock*)
+      (loop (multiple-value-bind (ev ok) (mb-try *outbox*)
+              (unless ok (return))
+              (handler-case (apply-event ev)
+                (serious-condition (e) (format *error-output* "~&operandi-gui: event ~s: ~a~%" (first ev) e))))))))
 
 ;;; ------------------------------ lifecycle -----------------------------
 (defun start-agent (&key (model *model*))
   "Configure the LLM backend and start the single worker thread (idempotent)."
+  ;; The environment of the RUN, not of the build: *CHAT-URL* and *MODEL* were read when this file was
+  ;; loaded, which for a saved image (the phone's) was on another machine.
+  (let ((u (uiop:getenv "OPERANDI_CHAT_URL")) (m (uiop:getenv "OPERANDI_CHAT_MODEL")))
+    (when (and u (plusp (length u))) (setf *chat-url* u))
+    (when (and m (plusp (length m)) (equal model *model*)) (setf model m *model* m)))
   (when (or model *chat-url*)
     (use-model model)
     (setf *model* llm:*llm-model*))
   (ensure-directories-exist session:*sessions-dir*)
   (unless (and *worker* (bt:thread-alive-p *worker*))
-    (setf *running* t
-          *worker* (bt:make-thread #'worker-loop :name "chat-agent")))
+    (install-host-tools)
+    (let ((in (make-mailbox "operandi-gui in")) (out (make-mailbox "operandi-gui out"))
+          (replies (make-mailbox "operandi-gui replies")))
+      (setf *inbox* in *outbox* out *replies* replies *pending* 0 *running* t
+            *worker* (bt:make-thread (lambda () (worker-loop in out)) :name "chat-agent"))))
   t)
 
 (defun stop-agent ()
   (setf *running* nil)
-  (bt:with-lock-held (*qlock*) (bt:condition-notify *qcv*)))
+  (when *inbox* (mb-send *inbox* (list :stop))))

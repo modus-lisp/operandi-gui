@@ -498,8 +498,7 @@ OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
       (when tools:*images* (format t "~&  pictures from ~a~%" (tools:images-label)) (force-output)))))
 
 (defun stop ()
-  (setf *running* nil)
-  (bt:with-lock-held (*qlock*) (bt:condition-notify *qcv*))
+  (stop-agent)
   (ignore-errors (sb-bsd-sockets:socket-close *sock*))
   (setf *sock* nil))
 
