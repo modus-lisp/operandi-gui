@@ -488,8 +488,11 @@ OPERANDI_CHAT_HOST, _PORT, _MODEL and _URL still set the first four.")
                          ((member a '("-h" "--help") :test #'string=)
                           (write-line +usage+) (uiop:quit 0))
                          (t (die "unknown flag ~a (--help lists them)" a))))))
-      (when (and (eq *backend* :ppq) (not model-given) (not (uiop:getenv "OPERANDI_CHAT_MODEL")))
-        (setf *model* "deepseek/deepseek-v4.1-flash"))
+      ;; *MODEL*'s default was chosen when this loaded, before the flags: OpenRouter's, unless
+      ;; OPERANDI_CHAT_URL was set.  --url and --ppq each want their own instead.
+      (unless (or model-given (uiop:getenv "OPERANDI_CHAT_MODEL"))
+        (cond ((eq *backend* :ppq) (setf *model* "deepseek/deepseek-v4.1-flash"))
+              (*chat-url* (setf *model* nil))))   ; nil: ask the server what it serves
       (start :host host :port port :model *model*)
       ;; reasoning: as asked; on a local server, high unless asked (operandi's default there is off,
       ;; and DeepSeek on illatio does better thinking -- ppq's and OpenRouter's think by themselves)
